@@ -280,50 +280,11 @@ Example with a stable public host:
 
 ## TTS for calls
 
-Voice Call uses the core `messages.tts` configuration for
-streaming speech on calls. You can override it under the plugin config with the
-**same shape** — it deep‑merges with `messages.tts`.
+Voice Call uses **only** `plugins.entries.voice-call.config.tts` for call speech.
+It does **not** read or merge the core `messages.tts` configuration (which is intended for
+messaging-channel TTS).
 
-```json5
-{
-  tts: {
-    provider: "elevenlabs",
-    providers: {
-      elevenlabs: {
-        voiceId: "pMsXgVXv3BLzUgSXRplE",
-        modelId: "eleven_multilingual_v2",
-      },
-    },
-  },
-}
-```
-
-Notes:
-
-- Legacy `tts.<provider>` keys inside plugin config (`openai`, `elevenlabs`, `microsoft`, `edge`) are auto-migrated to `tts.providers.<provider>` on load. Prefer the `providers` shape in committed config.
-- **Microsoft speech is ignored for voice calls** (telephony audio needs PCM; the current Microsoft transport does not expose telephony PCM output).
-- Core TTS is used when Twilio media streaming is enabled; otherwise calls fall back to provider native voices.
-- If a Twilio media stream is already active, Voice Call does not fall back to TwiML `<Say>`. If telephony TTS is unavailable in that state, the playback request fails instead of mixing two playback paths.
-- When telephony TTS falls back to a secondary provider, Voice Call logs a warning with the provider chain (`from`, `to`, `attempts`) for debugging.
-
-### More examples
-
-Use core TTS only (no override):
-
-```json5
-{
-  messages: {
-    tts: {
-      provider: "openai",
-      providers: {
-        openai: { voice: "alloy" },
-      },
-    },
-  },
-}
-```
-
-Override to ElevenLabs just for calls (keep core default elsewhere):
+Example:
 
 ```json5
 {
@@ -332,10 +293,9 @@ Override to ElevenLabs just for calls (keep core default elsewhere):
       "voice-call": {
         config: {
           tts: {
-            provider: "elevenlabs",
+            provider: "elevenlabs", // or "openai"
             providers: {
               elevenlabs: {
-                apiKey: "elevenlabs_key",
                 voiceId: "pMsXgVXv3BLzUgSXRplE",
                 modelId: "eleven_multilingual_v2",
               },
@@ -348,28 +308,14 @@ Override to ElevenLabs just for calls (keep core default elsewhere):
 }
 ```
 
-Override only the OpenAI model for calls (deep‑merge example):
+Notes:
 
-```json5
-{
-  plugins: {
-    entries: {
-      "voice-call": {
-        config: {
-          tts: {
-            providers: {
-              openai: {
-                model: "gpt-4o-mini-tts",
-                voice: "marin",
-              },
-            },
-          },
-        },
-      },
-    },
-  },
-}
-```
+- Legacy `tts.<provider>` keys inside plugin config (`openai`, `elevenlabs`, `microsoft`, `edge`) are auto-migrated to `tts.providers.<provider>` on load. Prefer the `providers` shape in committed config.
+- **Microsoft and Edge speech are ignored for voice calls** (telephony audio needs PCM; the current transports do not expose reliable telephony PCM output).
+- Telephony TTS is used when **Twilio media streaming** is enabled; otherwise calls fall back to provider native voices.
+- If a Twilio media stream is already active, Voice Call does not fall back to TwiML `<Say>`. If telephony TTS is unavailable in that state, the playback request fails instead of mixing two playback paths.
+- When telephony TTS falls back to a secondary provider, Voice Call logs a warning with the provider chain (`from`, `to`, `attempts`) for debugging.
+- For **ElevenLabs streaming**, set `tts.providers.elevenlabs.apiKey` + `voiceId`. (If you only set `ELEVENLABS_API_KEY`, the plugin may fall back to non-streaming synthesis.)
 
 ## Inbound calls
 
