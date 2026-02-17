@@ -68,7 +68,7 @@ function normalizeProviderConfig(
     languageCode: trimToUndefined(raw.languageCode) ?? trimToUndefined(raw.elevenlabsLanguageCode),
     vadSilenceThresholdSecs:
       asFiniteNumber(raw.vadSilenceThresholdSecs) ??
-      ((asFiniteNumber(raw.silenceDurationMs) ?? asFiniteNumber(raw.silenceDurationMs))
+      (asFiniteNumber(raw.silenceDurationMs) !== undefined
         ? (asFiniteNumber(raw.silenceDurationMs) as number) / 1000
         : undefined),
     vadThreshold: asFiniteNumber(raw.vadThreshold),
