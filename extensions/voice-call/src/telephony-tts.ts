@@ -117,8 +117,12 @@ async function* streamElevenLabsTelephony(
         yield Buffer.from(value);
       }
     }
-  } catch {
+  } catch (err: unknown) {
     // AbortError or stream cancelled — expected during barge-in
+    const isAbort = signal?.aborted || (err instanceof Error && err.name === "AbortError");
+    if (!isAbort) {
+      throw err;
+    }
   } finally {
     signal?.removeEventListener("abort", onAbort);
     try {
@@ -229,8 +233,12 @@ async function* streamOpenAITelephony(
         yield mulaw;
       }
     }
-  } catch {
+  } catch (err: unknown) {
     // AbortError or stream cancelled — expected during barge-in
+    const isAbort = signal?.aborted || (err instanceof Error && err.name === "AbortError");
+    if (!isAbort) {
+      throw err;
+    }
   } finally {
     signal?.removeEventListener("abort", onAbort);
     try {
