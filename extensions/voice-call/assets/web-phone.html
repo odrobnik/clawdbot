@@ -63,14 +63,19 @@ const TOKEN = qs.get('token') || '';
 // ─────────────────────────────────────────────────────────────
 
 const TARGET_SAMPLE_RATE = 16000;
+const PLAYBACK_SAFETY_SEC = 0.05;
+const PLAYBACK_FADE_SEC = 0.004;
+const MAX_QUEUE_CHUNKS = 80;
+const MAX_BUFFER_AHEAD_SEC = 2.5;
+
 let ws = null;
 let audioCtx = null;
 let micStream = null;
 let scriptNode = null;
 let connected = false;
 let audioQueue = [];
-let isPlaying = false;
-let currentSource = null;
+let scheduledSources = [];
+let nextPlayTime = 0;
 let lastFinalUserText = '';
 
 const btn = document.getElementById('callBtn');
@@ -91,7 +96,8 @@ async function startCall() {
   statusText.textContent = 'Connecting…';
   transcript.innerHTML = '';
   audioQueue = [];
-  isPlaying = false;
+  scheduledSources = [];
+  nextPlayTime = 0;
   lastFinalUserText = '';
 
   try {
@@ -149,10 +155,10 @@ function hangup() {
 function cleanup() {
   connected = false;
   if (scriptNode) { scriptNode.disconnect(); scriptNode = null; }
+  clearAudioPlayback();
   if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; }
   if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
   if (ws) { ws.close(); ws = null; }
-  clearAudioPlayback();
   statusDot.className = 'status-dot';
   statusText.textContent = 'Disconnected';
   stateLabel.textContent = '';
@@ -192,15 +198,18 @@ function startMicCapture() {
 
   source.connect(scriptNode);
   scriptNode.connect(audioCtx.destination); // required for onaudioprocess to fire
+  scheduleQueuedAudio();
 }
 
 function clearAudioPlayback() {
   audioQueue = [];
-  isPlaying = false;
-  if (currentSource) {
-    try { currentSource.onended = null; currentSource.stop(); } catch {}
-    currentSource = null;
+  nextPlayTime = 0;
+  for (const entry of scheduledSources) {
+    try { entry.source.onended = null; entry.source.stop(); } catch {}
+    try { entry.source.disconnect(); } catch {}
+    try { entry.gainNode.disconnect(); } catch {}
   }
+  scheduledSources = [];
 }
 
 function queueAudio(base64) {
@@ -212,14 +221,40 @@ function queueAudio(base64) {
   // Convert to float32
   const float32 = new Float32Array(pcm16.length);
   for (let i = 0; i < pcm16.length; i++) float32[i] = pcm16[i] / 32768;
+
+  if (audioQueue.length >= MAX_QUEUE_CHUNKS) {
+    const drop = audioQueue.length - MAX_QUEUE_CHUNKS + 1;
+    audioQueue.splice(0, drop);
+    console.warn(`[web-phone] Dropped ${drop} queued audio chunk(s) to cap backlog.`);
+  }
+
   audioQueue.push(float32);
-  if (!isPlaying) playNext();
+  scheduleQueuedAudio();
 }
 
-function playNext() {
-  if (!audioCtx || audioQueue.length === 0) { isPlaying = false; return; }
-  isPlaying = true;
-  const samples = audioQueue.shift();
+function scheduleQueuedAudio() {
+  if (!audioCtx) return;
+
+  if (!nextPlayTime || nextPlayTime < audioCtx.currentTime - PLAYBACK_SAFETY_SEC) {
+    nextPlayTime = audioCtx.currentTime + PLAYBACK_SAFETY_SEC;
+  }
+
+  while (audioQueue.length > 0) {
+    const samples = audioQueue[0];
+    const scheduled = scheduleChunk(samples);
+    if (!scheduled) {
+      // Too much audio is already buffered ahead; drop oldest unscheduled chunk.
+      audioQueue.shift();
+      console.warn('[web-phone] Dropped stale chunk to keep playback latency bounded.');
+      continue;
+    }
+    audioQueue.shift();
+  }
+}
+
+function scheduleChunk(samples) {
+  if (!audioCtx) return false;
+
   // Resample 16kHz → audioCtx.sampleRate for playback
   const outSR = audioCtx.sampleRate;
   const ratio = 16000 / outSR;
@@ -233,17 +268,51 @@ function playNext() {
     const s1 = samples[Math.min(idx + 1, samples.length - 1)] || 0;
     resampled[i] = s0 + frac * (s1 - s0);
   }
-  const buf = audioCtx.createBuffer(1, resampled.length, outSR);
-  buf.getChannelData(0).set(resampled);
-  const src = audioCtx.createBufferSource();
-  currentSource = src;
-  src.buffer = buf;
-  src.connect(audioCtx.destination);
-  src.onended = () => {
-    if (currentSource === src) currentSource = null;
-    playNext();
+
+  const buffer = audioCtx.createBuffer(1, resampled.length, outSR);
+  buffer.getChannelData(0).set(resampled);
+
+  const now = audioCtx.currentTime;
+  const minStartTime = now + PLAYBACK_SAFETY_SEC;
+  const startTime = Math.max(nextPlayTime, minStartTime);
+
+  if (startTime - now > MAX_BUFFER_AHEAD_SEC) {
+    return false;
+  }
+
+  const duration = buffer.duration;
+  const endTime = startTime + duration;
+
+  const source = audioCtx.createBufferSource();
+  const gainNode = audioCtx.createGain();
+  source.buffer = buffer;
+  source.connect(gainNode);
+  gainNode.connect(audioCtx.destination);
+
+  const fade = Math.min(PLAYBACK_FADE_SEC, duration / 2);
+  if (fade > 0) {
+    const fadeInEnd = startTime + fade;
+    const fadeOutStart = endTime - fade;
+    gainNode.gain.setValueAtTime(0, startTime);
+    gainNode.gain.linearRampToValueAtTime(1, fadeInEnd);
+    gainNode.gain.setValueAtTime(1, fadeOutStart);
+    gainNode.gain.linearRampToValueAtTime(0, endTime);
+  } else {
+    gainNode.gain.setValueAtTime(1, startTime);
+  }
+
+  const entry = { source, gainNode, endTime };
+  source.onended = () => {
+    source.onended = null;
+    try { source.disconnect(); } catch {}
+    try { gainNode.disconnect(); } catch {}
+    scheduledSources = scheduledSources.filter((item) => item !== entry);
   };
-  src.start();
+
+  source.start(startTime);
+  nextPlayTime = endTime;
+  scheduledSources.push(entry);
+  return true;
 }
 
 function normalizeTranscriptText(value) {
