@@ -166,7 +166,7 @@ export function chunkPcm16Even(pcmAudio: Buffer, chunkBytes = PCM16_WEB_CHUNK_BY
   return chunks;
 }
 
-// Pre-loaded web filler clips (converted to PCM16/16k)
+// Pre-loaded web filler clips (prefer native PCM16/16k, fallback to mu-law conversion)
 let webFillerCache: Map<string, Buffer> | null = null;
 
 function attenuateMulaw(buf: Buffer, factor: number): Buffer {
@@ -181,6 +181,23 @@ function attenuateMulaw(buf: Buffer, factor: number): Buffer {
   return out;
 }
 
+function attenuatePcm16(buf: Buffer, factor: number): Buffer {
+  if (factor <= 1) {
+    return buf;
+  }
+
+  const evenLength = buf.length - (buf.length % PCM16_SAMPLE_BYTES);
+  const aligned = evenLength === buf.length ? buf : buf.subarray(0, evenLength);
+  const out = Buffer.alloc(aligned.length);
+  for (let i = 0; i < aligned.length; i += PCM16_SAMPLE_BYTES) {
+    const sample = aligned.readInt16LE(i);
+    const scaled = Math.round(sample / factor);
+    const clamped = Math.max(-32768, Math.min(32767, scaled));
+    out.writeInt16LE(clamped, i);
+  }
+  return out;
+}
+
 function loadWebFillerClips(volumeReduction: number): Map<string, Buffer> {
   if (webFillerCache) {
     return webFillerCache;
@@ -188,12 +205,25 @@ function loadWebFillerClips(volumeReduction: number): Map<string, Buffer> {
 
   webFillerCache = new Map();
   for (const clip of ["typing", "processing"] as const) {
-    const clipPath = path.join(ASSETS_DIR, `${clip}.raw`);
-    if (!fs.existsSync(clipPath)) {
+    const pcm16Path = path.join(ASSETS_DIR, `${clip}.pcm16_16k.raw`);
+    if (fs.existsSync(pcm16Path)) {
+      const pcm16Raw = fs.readFileSync(pcm16Path);
+      const attenuatedPcm16 = attenuatePcm16(pcm16Raw, volumeReduction);
+      if (attenuatedPcm16.length > 0) {
+        webFillerCache.set(clip, attenuatedPcm16);
+        continue;
+      }
+    }
+
+    const ulaw8kPath = path.join(ASSETS_DIR, `${clip}.ulaw_8k.raw`);
+    const legacyPath = path.join(ASSETS_DIR, `${clip}.raw`);
+    const mulawPath = fs.existsSync(ulaw8kPath) ? ulaw8kPath : legacyPath;
+
+    if (!fs.existsSync(mulawPath)) {
       continue;
     }
 
-    const mulawRaw = fs.readFileSync(clipPath);
+    const mulawRaw = fs.readFileSync(mulawPath);
     const attenuated = attenuateMulaw(mulawRaw, volumeReduction);
     const pcm16k = mulaw8kToPcm16k(attenuated);
     webFillerCache.set(clip, pcm16k);
