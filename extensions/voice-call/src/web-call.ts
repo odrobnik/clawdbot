@@ -79,6 +79,93 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const PCM16_WEB_CHUNK_BYTES = 3200; // 100ms @ 16kHz PCM16 mono
+const PCM16_SAMPLE_BYTES = 2;
+
+/**
+ * PCM16 must stay aligned on 2-byte boundaries. If a websocket "audio" message
+ * ever contains an odd number of bytes, browser-side Int16 decoding shifts by
+ * one byte and all subsequent playback sounds like static.
+ */
+export class Pcm16WebChunkAligner {
+  private frameRemainder = Buffer.alloc(0);
+  private trailingByteRemainder = Buffer.alloc(0); // 0 or 1 byte
+
+  constructor(private readonly chunkBytes = PCM16_WEB_CHUNK_BYTES) {}
+
+  push(pcmChunk: Buffer): Buffer[] {
+    if (pcmChunk.length === 0) {
+      return [];
+    }
+
+    let combined = pcmChunk;
+    if (this.frameRemainder.length > 0 || this.trailingByteRemainder.length > 0) {
+      combined = Buffer.concat([this.frameRemainder, this.trailingByteRemainder, pcmChunk]);
+      this.frameRemainder = Buffer.alloc(0);
+      this.trailingByteRemainder = Buffer.alloc(0);
+    }
+
+    const evenLength = combined.length - (combined.length % PCM16_SAMPLE_BYTES);
+    const aligned = combined.subarray(0, evenLength);
+    if (evenLength < combined.length) {
+      this.trailingByteRemainder = Buffer.from(combined.subarray(evenLength));
+    }
+
+    const frames: Buffer[] = [];
+    for (let i = 0; i + this.chunkBytes <= aligned.length; i += this.chunkBytes) {
+      frames.push(Buffer.from(aligned.subarray(i, i + this.chunkBytes)));
+    }
+
+    const sentBytes = Math.floor(aligned.length / this.chunkBytes) * this.chunkBytes;
+    if (sentBytes < aligned.length) {
+      this.frameRemainder = Buffer.from(aligned.subarray(sentBytes));
+    }
+
+    return frames;
+  }
+
+  flush(): Buffer | null {
+    const buffered =
+      this.trailingByteRemainder.length > 0
+        ? Buffer.concat([this.frameRemainder, this.trailingByteRemainder])
+        : this.frameRemainder;
+    const evenLength = buffered.length - (buffered.length % PCM16_SAMPLE_BYTES);
+    const tail = evenLength > 0 ? Buffer.from(buffered.subarray(0, evenLength)) : null;
+    this.reset();
+    return tail;
+  }
+
+  reset(): void {
+    this.frameRemainder = Buffer.alloc(0);
+    this.trailingByteRemainder = Buffer.alloc(0);
+  }
+}
+
+export function chunkPcm16Even(pcmAudio: Buffer, chunkBytes = PCM16_WEB_CHUNK_BYTES): Buffer[] {
+  const chunks: Buffer[] = [];
+  let carry = Buffer.alloc(0);
+
+  for (let i = 0; i < pcmAudio.length; i += chunkBytes) {
+    const slice = pcmAudio.subarray(i, Math.min(i + chunkBytes, pcmAudio.length));
+    let merged = slice;
+
+    if (carry.length > 0) {
+      merged = Buffer.concat([carry, slice]);
+      carry = Buffer.alloc(0);
+    }
+
+    const evenLength = merged.length - (merged.length % PCM16_SAMPLE_BYTES);
+    if (evenLength > 0) {
+      chunks.push(Buffer.from(merged.subarray(0, evenLength)));
+    }
+    if (evenLength < merged.length) {
+      carry = Buffer.from(merged.subarray(evenLength));
+    }
+  }
+
+  return chunks;
+}
+
 // Pre-loaded web filler clips (converted to PCM16/16k)
 let webFillerCache: Map<string, Buffer> | null = null;
 
@@ -353,15 +440,35 @@ export class WebCallHandler {
 
     if (this.audioFormat === "pcm16_16k") {
       if (ttsProvider.streamForWeb) {
-        for await (const chunk of ttsProvider.streamForWeb(text, signal)) {
-          if (signal.aborted || session.closed) {
-            break;
+        const aligner = new Pcm16WebChunkAligner(PCM16_WEB_CHUNK_BYTES);
+        try {
+          for await (const chunk of ttsProvider.streamForWeb(text, signal)) {
+            if (signal.aborted || session.closed) {
+              break;
+            }
+            const pcm16k =
+              chunk.sampleRate === 16000
+                ? chunk.audio
+                : resamplePcmTo16k(chunk.audio, chunk.sampleRate);
+
+            const frames = aligner.push(pcm16k);
+            for (const frame of frames) {
+              if (signal.aborted || session.closed) {
+                break;
+              }
+              await this.sendPcmToClient(session, frame, signal);
+            }
           }
-          const pcm16k =
-            chunk.sampleRate === 16000
-              ? chunk.audio
-              : resamplePcmTo16k(chunk.audio, chunk.sampleRate);
-          await this.sendPcmToClient(session, pcm16k, signal);
+
+          if (!signal.aborted && !session.closed) {
+            const tail = aligner.flush();
+            if (tail && tail.length > 0) {
+              await this.sendPcmToClient(session, tail, signal);
+            }
+          }
+        } finally {
+          // Abort/stop should not leak remainders into a future response.
+          aligner.reset();
         }
         return;
       }
@@ -409,12 +516,13 @@ export class WebCallHandler {
     pcmAudio: Buffer,
     signal: AbortSignal,
   ): Promise<void> {
-    const CHUNK_BYTES = 3200; // 100ms @ 16kHz PCM16 mono
-    for (let i = 0; i < pcmAudio.length; i += CHUNK_BYTES) {
+    // Never emit odd-length chunks: Int16Array decoding in the browser requires
+    // exact 2-byte sample alignment.
+    const chunks = chunkPcm16Even(pcmAudio, PCM16_WEB_CHUNK_BYTES);
+    for (const chunk of chunks) {
       if (signal.aborted || session.closed) {
         break;
       }
-      const chunk = pcmAudio.subarray(i, Math.min(i + CHUNK_BYTES, pcmAudio.length));
       sendMessage(session.ws, { type: "audio", data: chunk.toString("base64") });
       await sleep(100);
     }
@@ -460,8 +568,6 @@ export class WebCallHandler {
   private async playFiller(session: WebCallSession, signal: AbortSignal): Promise<void> {
     const clips = loadWebFillerClips(2);
     const clipNames = this.fillerSfxSet === "processing" ? ["processing"] : ["typing"];
-    const CHUNK_BYTES = 3200; // 100ms @ 16kHz PCM16 mono
-
     try {
       while (!signal.aborted && !session.closed) {
         const name = clipNames[Math.floor(Math.random() * clipNames.length)];
@@ -470,8 +576,12 @@ export class WebCallHandler {
           return;
         }
 
-        for (let i = 0; i < clip.length && !signal.aborted && !session.closed; i += CHUNK_BYTES) {
-          const chunk = clip.subarray(i, Math.min(i + CHUNK_BYTES, clip.length));
+        for (
+          let i = 0;
+          i < clip.length && !signal.aborted && !session.closed;
+          i += PCM16_WEB_CHUNK_BYTES
+        ) {
+          const chunk = clip.subarray(i, Math.min(i + PCM16_WEB_CHUNK_BYTES, clip.length));
           sendMessage(session.ws, { type: "audio", data: chunk.toString("base64") });
           await sleep(100);
         }

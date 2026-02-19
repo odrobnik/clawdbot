@@ -65,6 +65,8 @@ function buildElevenLabsBody(text: string, config: NonNullable<VoiceCallTtsConfi
   return JSON.stringify(body);
 }
 
+const PCM16_SAMPLE_BYTES = 2;
+
 async function* streamFetchBody(
   response: Response,
   signal?: AbortSignal,
@@ -101,6 +103,25 @@ async function* streamFetchBody(
     } catch {
       // Reader may already be released after cancel
     }
+  }
+}
+
+async function* streamFetchBodyAlignedPcm16(
+  response: Response,
+  signal?: AbortSignal,
+): AsyncGenerator<Buffer, void, unknown> {
+  // HTTP stream chunking is arbitrary and can split 16-bit PCM samples.
+  // Preserve a trailing byte so downstream never receives odd-length PCM.
+  let remainder = Buffer.alloc(0);
+
+  for await (const chunk of streamFetchBody(response, signal)) {
+    const combined = remainder.length > 0 ? Buffer.concat([remainder, chunk]) : chunk;
+    const evenLength = combined.length - (combined.length % PCM16_SAMPLE_BYTES);
+    if (evenLength > 0) {
+      yield combined.subarray(0, evenLength);
+    }
+    remainder =
+      evenLength < combined.length ? Buffer.from(combined.subarray(evenLength)) : Buffer.alloc(0);
   }
 }
 
@@ -174,7 +195,7 @@ async function* streamElevenLabsWebPcm(
     throw new Error(`ElevenLabs PCM streaming TTS failed: ${response.status} ${errorText}`);
   }
 
-  for await (const chunk of streamFetchBody(response, signal)) {
+  for await (const chunk of streamFetchBodyAlignedPcm16(response, signal)) {
     yield { audio: chunk, sampleRate: 16000 };
   }
 }
@@ -288,7 +309,7 @@ async function* streamOpenAIWebPcm(
     throw new Error(`OpenAI PCM streaming TTS failed: ${response.status} ${errorText}`);
   }
 
-  for await (const chunk of streamFetchBody(response, signal)) {
+  for await (const chunk of streamFetchBodyAlignedPcm16(response, signal)) {
     yield { audio: chunk, sampleRate: 24000 };
   }
 }
