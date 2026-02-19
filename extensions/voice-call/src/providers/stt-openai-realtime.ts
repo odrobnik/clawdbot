@@ -2,13 +2,18 @@
  * OpenAI Realtime STT Provider
  *
  * Uses the OpenAI Realtime API for streaming transcription with:
- * - Direct mu-law audio support (no conversion needed)
+ * - Configurable input format (g711_ulaw or pcm16)
  * - Built-in server-side VAD for turn detection
  * - Low-latency streaming transcription
  * - Partial transcript callbacks for real-time UI updates
  */
 
 import WebSocket from "ws";
+import { resamplePcm } from "../telephony-audio.js";
+
+const OPENAI_PCM_SAMPLE_RATE = 24000;
+
+type RealtimeInputAudioFormat = "g711_ulaw" | "pcm16";
 
 /**
  * Configuration for OpenAI Realtime STT.
@@ -25,12 +30,22 @@ export interface RealtimeSTTConfig {
 }
 
 /**
+ * Session creation options.
+ */
+export interface RealtimeSTTSessionOptions {
+  /** Input encoding sent to OpenAI (default: g711_ulaw) */
+  inputAudioFormat?: RealtimeInputAudioFormat;
+  /** Source sample rate for pcm16 input (default: 16000 for pcm16, 8000 for g711_ulaw) */
+  inputSampleRate?: number;
+}
+
+/**
  * Session for streaming audio and receiving transcripts.
  */
 export interface RealtimeSTTSession {
   /** Connect to the transcription service */
   connect(): Promise<void>;
-  /** Send mu-law audio data (8kHz mono) */
+  /** Send audio data according to session inputAudioFormat */
   sendAudio(audio: Buffer): void;
   /** Wait for next complete transcript (after VAD detects end of speech) */
   waitForTranscript(timeoutMs?: number): Promise<string>;
@@ -69,12 +84,13 @@ export class OpenAIRealtimeSTTProvider {
   /**
    * Create a new realtime transcription session.
    */
-  createSession(): RealtimeSTTSession {
+  createSession(options?: RealtimeSTTSessionOptions): RealtimeSTTSession {
     return new OpenAIRealtimeSTTSession(
       this.apiKey,
       this.model,
       this.silenceDurationMs,
       this.vadThreshold,
+      options,
     );
   }
 }
@@ -94,13 +110,20 @@ class OpenAIRealtimeSTTSession implements RealtimeSTTSession {
   private onTranscriptCallback: ((transcript: string) => void) | null = null;
   private onPartialCallback: ((partial: string) => void) | null = null;
   private onSpeechStartCallback: (() => void) | null = null;
+  private readonly inputAudioFormat: RealtimeInputAudioFormat;
+  private readonly inputSampleRate: number;
 
   constructor(
     private readonly apiKey: string,
     private readonly model: string,
     private readonly silenceDurationMs: number,
     private readonly vadThreshold: number,
-  ) {}
+    options?: RealtimeSTTSessionOptions,
+  ) {
+    this.inputAudioFormat = options?.inputAudioFormat ?? "g711_ulaw";
+    this.inputSampleRate =
+      options?.inputSampleRate ?? (this.inputAudioFormat === "pcm16" ? 16000 : 8000);
+  }
 
   async connect(): Promise<void> {
     this.closed = false;
@@ -128,7 +151,7 @@ class OpenAIRealtimeSTTSession implements RealtimeSTTSession {
         this.sendEvent({
           type: "transcription_session.update",
           session: {
-            input_audio_format: "g711_ulaw",
+            input_audio_format: this.inputAudioFormat,
             input_audio_transcription: {
               model: this.model,
             },
@@ -259,13 +282,19 @@ class OpenAIRealtimeSTTSession implements RealtimeSTTSession {
     }
   }
 
-  sendAudio(muLawData: Buffer): void {
+  sendAudio(audio: Buffer): void {
     if (!this.connected) {
       return;
     }
+
+    let payload = audio;
+    if (this.inputAudioFormat === "pcm16" && this.inputSampleRate !== OPENAI_PCM_SAMPLE_RATE) {
+      payload = resamplePcm(audio, this.inputSampleRate, OPENAI_PCM_SAMPLE_RATE);
+    }
+
     this.sendEvent({
       type: "input_audio_buffer.append",
-      audio: muLawData.toString("base64"),
+      audio: payload.toString("base64"),
     });
   }
 

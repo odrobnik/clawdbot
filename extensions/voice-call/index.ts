@@ -104,6 +104,22 @@ const voiceCallConfigSchema = {
     responseModel: { label: "Response Model", advanced: true },
     responseSystemPrompt: { label: "Response System Prompt", advanced: true },
     responseTimeoutMs: { label: "Response Timeout (ms)", advanced: true },
+    "web.enabled": {
+      label: "Enable Web Phone",
+      help: "Allow browser-based voice calls via WebSocket.",
+      advanced: true,
+    },
+    "web.token": {
+      label: "Web Phone Token",
+      sensitive: true,
+      advanced: true,
+    },
+    "web.path": { label: "Web Phone WebSocket Path", advanced: true },
+    "web.audioFormat": {
+      label: "Web Phone Audio Format",
+      help: "ulaw8k keeps legacy telephony pipeline; pcm16_16k keeps browser audio fullband.",
+      advanced: true,
+    },
   },
 };
 

@@ -1,6 +1,8 @@
 import { spawn } from "node:child_process";
+import fs from "node:fs";
 import http from "node:http";
-import { URL } from "node:url";
+import path from "node:path";
+import { URL, fileURLToPath } from "node:url";
 import {
   isRequestBodyLimitError,
   readRequestBodyWithLimit,
@@ -21,6 +23,9 @@ import type { NormalizedEvent, WebhookContext } from "./types.js";
 import { WebCallHandler } from "./web-call.js";
 
 const MAX_WEBHOOK_BODY_BYTES = 1024 * 1024;
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const WEB_PHONE_HTML_PATH = path.resolve(__dirname, "..", "assets", "web-phone.html");
+const WEB_PHONE_BUILD = "2026-02-19-fullband-pcm16-v1";
 
 /**
  * HTTP server for receiving voice call webhooks from providers.
@@ -302,6 +307,9 @@ export class VoiceCallWebhookServer {
         }
         if (this.webCallHandler) {
           console.log(`[voice-call] Web phone WebSocket on ws://${bind}:${port}${webPath}`);
+          console.log(
+            `[voice-call] Web phone UI on http://${bind}:${port}${webPath}/phone (build ${WEB_PHONE_BUILD})`,
+          );
         }
         resolve(url);
 
@@ -379,6 +387,30 @@ export class VoiceCallWebhookServer {
     webhookPath: string,
   ): Promise<void> {
     const url = new URL(req.url || "/", `http://${req.headers.host}`);
+
+    // Serve built-in web phone UI with aggressive no-cache headers.
+    const webPath = this.config.web?.path || "/voice/web";
+    if (
+      req.method === "GET" &&
+      this.webCallHandler &&
+      (url.pathname === webPath || url.pathname === `${webPath}/phone`)
+    ) {
+      try {
+        const html = fs.readFileSync(WEB_PHONE_HTML_PATH, "utf8");
+        res.statusCode = 200;
+        res.setHeader("Content-Type", "text/html; charset=utf-8");
+        res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+        res.setHeader("Pragma", "no-cache");
+        res.setHeader("Expires", "0");
+        res.setHeader("X-Web-Phone-Build", WEB_PHONE_BUILD);
+        res.end(html);
+      } catch (err) {
+        console.error("[voice-call] Failed to serve web phone UI:", err);
+        res.statusCode = 500;
+        res.end("Failed to load web phone UI");
+      }
+      return;
+    }
 
     // Check path
     if (!url.pathname.startsWith(webhookPath)) {

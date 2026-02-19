@@ -188,6 +188,11 @@
     "web.path": {
       "label": "Web Phone WebSocket Path",
       "advanced": true
+    },
+    "web.audioFormat": {
+      "label": "Web Phone Audio Format",
+      "help": "ulaw8k keeps legacy telephony pipeline; pcm16_16k keeps browser audio fullband.",
+      "advanced": true
     }
   },
   "configSchema": {
@@ -625,6 +630,10 @@
           "path": {
             "type": "string",
             "minLength": 1
+          },
+          "audioFormat": {
+            "type": "string",
+            "enum": ["ulaw8k", "pcm16_16k"]
           }
         }
       }

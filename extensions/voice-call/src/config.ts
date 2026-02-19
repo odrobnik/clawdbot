@@ -254,6 +254,9 @@ export type VoiceCallStreamingConfig = z.infer<typeof VoiceCallStreamingConfigSc
 // Web Phone Configuration
 // -----------------------------------------------------------------------------
 
+export const VoiceCallWebAudioFormatSchema = z.enum(["ulaw8k", "pcm16_16k"]);
+export type VoiceCallWebAudioFormat = z.infer<typeof VoiceCallWebAudioFormatSchema>;
+
 export const VoiceCallWebConfigSchema = z
   .object({
     /** Enable web phone (browser-based calling) */
@@ -262,9 +265,11 @@ export const VoiceCallWebConfigSchema = z
     token: z.string().min(1).optional(),
     /** WebSocket path for web phone connections */
     path: z.string().min(1).default("/voice/web"),
+    /** Browser/web-phone audio mode */
+    audioFormat: VoiceCallWebAudioFormatSchema.default("ulaw8k"),
   })
   .strict()
-  .default({ enabled: false, path: "/voice/web" });
+  .default({ enabled: false, path: "/voice/web", audioFormat: "ulaw8k" });
 export type VoiceCallWebConfig = z.infer<typeof VoiceCallWebConfigSchema>;
 
 // -----------------------------------------------------------------------------

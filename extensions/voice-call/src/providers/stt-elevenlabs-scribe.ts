@@ -5,11 +5,12 @@
  * - Server-side VAD for turn detection
  * - Low-latency streaming transcription (~150ms)
  * - Partial and committed transcript callbacks
- * - Mu-law 8kHz input from Twilio (converted to PCM 16kHz for Scribe)
+ * - Configurable input format (g711_ulaw or pcm16)
  */
 
 import WebSocket from "ws";
-import type { RealtimeSTTSession } from "./stt-openai-realtime.js";
+import { mulawToPcm, resamplePcmTo16k } from "../telephony-audio.js";
+import type { RealtimeSTTSession, RealtimeSTTSessionOptions } from "./stt-openai-realtime.js";
 
 /**
  * Configuration for ElevenLabs Scribe STT.
@@ -52,61 +53,16 @@ export class ElevenLabsScribeSTTProvider {
   /**
    * Create a new realtime transcription session.
    */
-  createSession(): RealtimeSTTSession {
+  createSession(options?: RealtimeSTTSessionOptions): RealtimeSTTSession {
     return new ElevenLabsScribeSTTSession(
       this.apiKey,
       this.model,
       this.languageCode,
       this.vadSilenceThresholdSecs,
       this.vadThreshold,
+      options,
     );
   }
-}
-
-// --------------------------------------------------------------------------
-// Mu-law → PCM 16-bit conversion (G.711 decoding)
-// --------------------------------------------------------------------------
-
-const MULAW_DECODE_TABLE = new Int16Array(256);
-(function buildMulawTable() {
-  for (let i = 0; i < 256; i++) {
-    const mu = ~i & 0xff;
-    const sign = mu & 0x80;
-    const exponent = (mu >> 4) & 0x07;
-    const mantissa = mu & 0x0f;
-    let sample = ((mantissa << 3) + 132) << exponent;
-    sample -= 132;
-    MULAW_DECODE_TABLE[i] = sign ? -sample : sample;
-  }
-})();
-
-/**
- * Decode mu-law 8kHz audio to PCM 16-bit 16kHz (upsample 2x with linear interpolation).
- * Scribe expects PCM 16kHz; Twilio sends mu-law 8kHz.
- */
-function mulawTopcm16k(mulaw: Buffer): Buffer {
-  const inputSamples = mulaw.length;
-  // Decode mu-law to 16-bit PCM at 8kHz
-  const pcm8k = new Int16Array(inputSamples);
-  for (let i = 0; i < inputSamples; i++) {
-    pcm8k[i] = MULAW_DECODE_TABLE[mulaw[i]];
-  }
-
-  // Upsample 8kHz → 16kHz with linear interpolation (2x)
-  const outputSamples = inputSamples * 2;
-  const output = Buffer.alloc(outputSamples * 2); // 16-bit = 2 bytes per sample
-
-  for (let i = 0; i < inputSamples; i++) {
-    const s0 = pcm8k[i];
-    const s1 = i + 1 < inputSamples ? pcm8k[i + 1] : s0;
-
-    // Original sample
-    output.writeInt16LE(s0, i * 4);
-    // Interpolated sample
-    output.writeInt16LE(Math.round((s0 + s1) / 2), i * 4 + 2);
-  }
-
-  return output;
 }
 
 // --------------------------------------------------------------------------
@@ -125,6 +81,8 @@ class ElevenLabsScribeSTTSession implements RealtimeSTTSession {
   private onPartialCallback: ((partial: string) => void) | null = null;
   private onSpeechStartCallback: (() => void) | null = null;
   private speechActive = false;
+  private readonly inputAudioFormat: "g711_ulaw" | "pcm16";
+  private readonly inputSampleRate: number;
 
   constructor(
     private readonly apiKey: string,
@@ -132,7 +90,12 @@ class ElevenLabsScribeSTTSession implements RealtimeSTTSession {
     private readonly languageCode: string | undefined,
     private readonly vadSilenceThresholdSecs: number,
     private readonly vadThreshold: number,
-  ) {}
+    options?: RealtimeSTTSessionOptions,
+  ) {
+    this.inputAudioFormat = options?.inputAudioFormat ?? "g711_ulaw";
+    this.inputSampleRate =
+      options?.inputSampleRate ?? (this.inputAudioFormat === "pcm16" ? 16000 : 8000);
+  }
 
   async connect(): Promise<void> {
     this.closed = false;
@@ -290,16 +253,21 @@ class ElevenLabsScribeSTTSession implements RealtimeSTTSession {
   }
 
   /**
-   * Send mu-law 8kHz audio from Twilio.
-   * Converts to PCM 16kHz for Scribe, then sends as base64.
+   * Send audio data. Scribe expects PCM 16kHz base64 chunks.
    */
-  sendAudio(muLawData: Buffer): void {
+  sendAudio(audio: Buffer): void {
     if (!this.connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
       return;
     }
 
-    // Convert mu-law 8kHz → PCM 16kHz for Scribe
-    const pcm16k = mulawTopcm16k(muLawData);
+    let pcm16k: Buffer;
+    if (this.inputAudioFormat === "pcm16") {
+      pcm16k =
+        this.inputSampleRate === 16000 ? audio : resamplePcmTo16k(audio, this.inputSampleRate);
+    } else {
+      const pcm8k = mulawToPcm(audio);
+      pcm16k = resamplePcmTo16k(pcm8k, 8000);
+    }
 
     this.ws.send(
       JSON.stringify({

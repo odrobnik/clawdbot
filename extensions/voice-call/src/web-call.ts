@@ -2,27 +2,39 @@
  * Web Call Handler
  *
  * Handles browser-based voice calls over WebSocket.
- * The browser sends PCM 16kHz 16-bit mono audio and receives the same format back.
- * Internally converts to/from mu-law 8kHz for the existing STT/TTS pipeline.
+ * Browser I/O is PCM16@16kHz base64. Internally we can run either:
+ * - ulaw8k (legacy): convert browser PCM -> mu-law for STT/TTS pipeline
+ * - pcm16_16k (fullband): keep PCM end-to-end for web calls
  */
 
+import fs from "node:fs";
 import type { IncomingMessage } from "node:http";
+import path from "node:path";
 import type { Duplex } from "node:stream";
+import { fileURLToPath } from "node:url";
 import { WebSocket, WebSocketServer } from "ws";
 import type { VoiceCallConfig } from "./config.js";
 import type { CoreConfig } from "./core-bridge.js";
-import type { MediaStreamConfig } from "./media-stream.js";
-import { MediaStreamHandler } from "./media-stream.js";
 import type { ElevenLabsScribeSTTProvider } from "./providers/stt-elevenlabs-scribe.js";
-import type { OpenAIRealtimeSTTProvider } from "./providers/stt-openai-realtime.js";
-import type { RealtimeSTTSession } from "./providers/stt-openai-realtime.js";
-import { SilenceFiller } from "./silence-filler.js";
-import { pcmToMulaw, resamplePcmTo8k } from "./telephony-audio.js";
+import type {
+  OpenAIRealtimeSTTProvider,
+  RealtimeSTTSession,
+  RealtimeSTTSessionOptions,
+} from "./providers/stt-openai-realtime.js";
+import {
+  mulaw8kToPcm16k,
+  pcmToMulaw,
+  resamplePcmTo16k,
+  resamplePcmTo8k,
+} from "./telephony-audio.js";
 import type { TelephonyTtsProvider } from "./telephony-tts.js";
-import { createTelephonyTtsProvider } from "./telephony-tts.js";
-import type { NormalizedEvent } from "./types.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const ASSETS_DIR = path.resolve(__dirname, "..", "assets");
 
 type STTProvider = OpenAIRealtimeSTTProvider | ElevenLabsScribeSTTProvider;
+
+type WebAudioFormat = "ulaw8k" | "pcm16_16k";
 
 /** Incoming messages from the browser */
 type WebClientMessage = { type: "audio"; data: string } | { type: "hangup" };
@@ -30,6 +42,7 @@ type WebClientMessage = { type: "audio"; data: string } | { type: "hangup" };
 /** Outgoing messages to the browser */
 type WebServerMessage =
   | { type: "audio"; data: string }
+  | { type: "audio_clear" }
   | { type: "transcript"; text: string; role: "user" | "agent"; final: boolean }
   | { type: "state"; value: "listening" | "thinking" | "speaking" }
   | { type: "ended" };
@@ -40,6 +53,8 @@ interface WebCallSession {
   sttSession: RealtimeSTTSession;
   /** AbortController for current response generation */
   responseController: AbortController | null;
+  fillerTimer: ReturnType<typeof setTimeout> | null;
+  fillerController: AbortController | null;
   closed: boolean;
 }
 
@@ -53,49 +68,51 @@ function sendMessage(ws: WebSocket, msg: WebServerMessage): void {
 }
 
 /**
- * Convert mu-law 8kHz audio to PCM 16kHz 16-bit for browser playback.
- */
-function mulawToLinear(mulaw: number): number {
-  const BIAS = 33;
-  let mu = ~mulaw & 0xff;
-  const sign = mu & 0x80;
-  const exponent = (mu >> 4) & 0x07;
-  const mantissa = mu & 0x0f;
-  let sample = ((mantissa << 3) + BIAS) << exponent;
-  sample -= BIAS;
-  return sign ? -sample : sample;
-}
-
-function mulaw8kToPcm16k(mulawBuf: Buffer): Buffer {
-  // Decode mu-law to PCM 8kHz
-  const pcm8k = Buffer.alloc(mulawBuf.length * 2);
-  for (let i = 0; i < mulawBuf.length; i++) {
-    const sample = mulawToLinear(mulawBuf[i]);
-    pcm8k.writeInt16LE(sample, i * 2);
-  }
-  // Upsample 8kHz → 16kHz via linear interpolation
-  const inputSamples = mulawBuf.length;
-  const outputSamples = inputSamples * 2;
-  const pcm16k = Buffer.alloc(outputSamples * 2);
-  for (let i = 0; i < outputSamples; i++) {
-    const srcPos = i / 2;
-    const srcIdx = Math.floor(srcPos);
-    const frac = srcPos - srcIdx;
-    const s0 = pcm8k.readInt16LE(srcIdx * 2);
-    const s1Idx = Math.min(srcIdx + 1, inputSamples - 1);
-    const s1 = pcm8k.readInt16LE(s1Idx * 2);
-    const sample = Math.round(s0 + frac * (s1 - s0));
-    pcm16k.writeInt16LE(Math.max(-32768, Math.min(32767, sample)), i * 2);
-  }
-  return pcm16k;
-}
-
-/**
- * Convert PCM 16kHz 16-bit mono to mu-law 8kHz for the STT pipeline.
+ * Convert PCM 16kHz 16-bit mono to mu-law 8kHz for the legacy STT pipeline.
  */
 function pcm16kToMulaw8k(pcmBuf: Buffer): Buffer {
   const pcm8k = resamplePcmTo8k(pcmBuf, 16000);
   return pcmToMulaw(pcm8k);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Pre-loaded web filler clips (converted to PCM16/16k)
+let webFillerCache: Map<string, Buffer> | null = null;
+
+function attenuateMulaw(buf: Buffer, factor: number): Buffer {
+  if (factor <= 1) {
+    return buf;
+  }
+  const out = Buffer.alloc(buf.length);
+  const silence = 0xff;
+  for (let i = 0; i < buf.length; i++) {
+    out[i] = Math.round(buf[i] + (silence - buf[i]) * (1 - 1 / factor));
+  }
+  return out;
+}
+
+function loadWebFillerClips(volumeReduction: number): Map<string, Buffer> {
+  if (webFillerCache) {
+    return webFillerCache;
+  }
+
+  webFillerCache = new Map();
+  for (const clip of ["typing", "processing"] as const) {
+    const clipPath = path.join(ASSETS_DIR, `${clip}.raw`);
+    if (!fs.existsSync(clipPath)) {
+      continue;
+    }
+
+    const mulawRaw = fs.readFileSync(clipPath);
+    const attenuated = attenuateMulaw(mulawRaw, volumeReduction);
+    const pcm16k = mulaw8kToPcm16k(attenuated);
+    webFillerCache.set(clip, pcm16k);
+  }
+
+  return webFillerCache;
 }
 
 export type WebCallDeps = {
@@ -113,9 +130,17 @@ export class WebCallHandler {
   private wss: WebSocketServer | null = null;
   private sessions = new Map<string, WebCallSession>();
   private deps: WebCallDeps;
+  private readonly audioFormat: WebAudioFormat;
+  private readonly fillerEnabled: boolean;
+  private readonly fillerThresholdMs: number;
+  private readonly fillerSfxSet: "typing" | "processing";
 
   constructor(deps: WebCallDeps) {
     this.deps = deps;
+    this.audioFormat = deps.config.web?.audioFormat ?? "ulaw8k";
+    this.fillerEnabled = deps.config.silenceFiller?.enabled ?? true;
+    this.fillerThresholdMs = deps.config.silenceFiller?.thresholdMs ?? 3500;
+    this.fillerSfxSet = deps.config.silenceFiller?.sfxSet ?? "typing";
   }
 
   /**
@@ -149,16 +174,23 @@ export class WebCallHandler {
    */
   private async handleConnection(ws: WebSocket): Promise<void> {
     const sessionId = `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    console.log(`[web-call] New connection: ${sessionId}`);
+    console.log(`[web-call] New connection: ${sessionId} (audioFormat=${this.audioFormat})`);
+
+    const sttSessionOptions: RealtimeSTTSessionOptions =
+      this.audioFormat === "pcm16_16k"
+        ? { inputAudioFormat: "pcm16", inputSampleRate: 16000 }
+        : { inputAudioFormat: "g711_ulaw", inputSampleRate: 8000 };
 
     // Create STT session
-    const sttSession = this.deps.sttProvider.createSession();
+    const sttSession = this.deps.sttProvider.createSession(sttSessionOptions);
 
     const session: WebCallSession = {
       id: sessionId,
       ws,
       sttSession,
       responseController: null,
+      fillerTimer: null,
+      fillerController: null,
       closed: false,
     };
 
@@ -173,17 +205,20 @@ export class WebCallHandler {
       console.log(`[web-call] Transcript for ${sessionId}: ${transcript}`);
       sendMessage(ws, { type: "transcript", text: transcript, role: "user", final: true });
       sendMessage(ws, { type: "state", value: "thinking" });
+      this.startFiller(session);
 
       // Generate and speak response
       void this.handleResponse(session, transcript);
     });
 
     sttSession.onSpeechStart(() => {
-      // Barge-in: cancel any in-progress response
+      // Barge-in: cancel any in-progress response and clear queued audio
       if (session.responseController) {
         session.responseController.abort();
         session.responseController = null;
       }
+      this.stopFiller(session, true);
+      sendMessage(ws, { type: "state", value: "listening" });
     });
 
     // Connect STT (non-blocking)
@@ -200,11 +235,18 @@ export class WebCallHandler {
 
         switch (msg.type) {
           case "audio": {
-            if (session.closed) break;
-            // Decode base64 PCM 16kHz → mu-law 8kHz for STT
+            if (session.closed) {
+              break;
+            }
+
             const pcmBuf = Buffer.from(msg.data, "base64");
-            const mulawBuf = pcm16kToMulaw8k(pcmBuf);
-            sttSession.sendAudio(mulawBuf);
+            if (this.audioFormat === "pcm16_16k") {
+              sttSession.sendAudio(pcmBuf);
+            } else {
+              // Legacy pipeline: browser PCM16k -> mu-law8k for STT
+              const mulawBuf = pcm16kToMulaw8k(pcmBuf);
+              sttSession.sendAudio(mulawBuf);
+            }
             break;
           }
           case "hangup":
@@ -229,7 +271,9 @@ export class WebCallHandler {
    * Handle agent response generation and TTS playback to the browser.
    */
   private async handleResponse(session: WebCallSession, userMessage: string): Promise<void> {
-    if (session.closed) return;
+    if (session.closed) {
+      return;
+    }
 
     const controller = new AbortController();
     session.responseController = controller;
@@ -246,10 +290,13 @@ export class WebCallHandler {
         userMessage,
       });
 
-      if (controller.signal.aborted || session.closed) return;
+      if (controller.signal.aborted || session.closed) {
+        return;
+      }
 
       if (result.error) {
         console.error(`[web-call] Response generation error: ${result.error}`);
+        this.stopFiller(session, false);
         sendMessage(session.ws, { type: "state", value: "listening" });
         return;
       }
@@ -262,9 +309,11 @@ export class WebCallHandler {
           role: "agent",
           final: true,
         });
+
+        // Stop filler and clear any queued filler chunks before speech starts.
+        this.stopFiller(session, true);
         sendMessage(session.ws, { type: "state", value: "speaking" });
 
-        // Stream TTS audio to browser
         await this.streamTtsToClient(session, result.text, controller.signal);
 
         if (result.endCall) {
@@ -281,6 +330,7 @@ export class WebCallHandler {
       if (!controller.signal.aborted) {
         console.error(`[web-call] Response error for ${session.id}:`, err);
       }
+      this.stopFiller(session, false);
       if (!session.closed) {
         sendMessage(session.ws, { type: "state", value: "listening" });
       }
@@ -293,7 +343,6 @@ export class WebCallHandler {
 
   /**
    * Stream TTS audio to the browser client.
-   * Converts mu-law 8kHz from the TTS pipeline to PCM 16kHz for the browser.
    */
   private async streamTtsToClient(
     session: WebCallSession,
@@ -302,25 +351,137 @@ export class WebCallHandler {
   ): Promise<void> {
     const ttsProvider = this.deps.ttsProvider;
 
+    if (this.audioFormat === "pcm16_16k") {
+      if (ttsProvider.streamForWeb) {
+        for await (const chunk of ttsProvider.streamForWeb(text, signal)) {
+          if (signal.aborted || session.closed) {
+            break;
+          }
+          const pcm16k =
+            chunk.sampleRate === 16000
+              ? chunk.audio
+              : resamplePcmTo16k(chunk.audio, chunk.sampleRate);
+          await this.sendPcmToClient(session, pcm16k, signal);
+        }
+        return;
+      }
+
+      if (ttsProvider.synthesizeForWeb) {
+        const pcm = await ttsProvider.synthesizeForWeb(text);
+        if (signal.aborted || session.closed) {
+          return;
+        }
+        const pcm16k =
+          pcm.sampleRate === 16000 ? pcm.audio : resamplePcmTo16k(pcm.audio, pcm.sampleRate);
+        await this.sendPcmToClient(session, pcm16k, signal);
+        return;
+      }
+    }
+
+    // Legacy compatibility path: telephony mu-law -> browser PCM16k
     if (ttsProvider.streamForTelephony) {
-      // Streaming mode: send chunks as they arrive
       for await (const mulawChunk of ttsProvider.streamForTelephony(text, signal)) {
-        if (signal.aborted || session.closed) break;
+        if (signal.aborted || session.closed) {
+          break;
+        }
         const pcm16k = mulaw8kToPcm16k(mulawChunk);
         sendMessage(session.ws, { type: "audio", data: pcm16k.toString("base64") });
       }
     } else {
-      // Buffered mode: synthesize entire audio then send
       const mulawAudio = await ttsProvider.synthesizeForTelephony(text);
-      if (signal.aborted || session.closed) return;
-      // Send in chunks to avoid huge single messages
+      if (signal.aborted || session.closed) {
+        return;
+      }
       const CHUNK_BYTES = 640; // 80ms at 8kHz mulaw
       for (let i = 0; i < mulawAudio.length; i += CHUNK_BYTES) {
-        if (signal.aborted || session.closed) break;
+        if (signal.aborted || session.closed) {
+          break;
+        }
         const chunk = mulawAudio.subarray(i, Math.min(i + CHUNK_BYTES, mulawAudio.length));
         const pcm16k = mulaw8kToPcm16k(chunk);
         sendMessage(session.ws, { type: "audio", data: pcm16k.toString("base64") });
       }
+    }
+  }
+
+  private async sendPcmToClient(
+    session: WebCallSession,
+    pcmAudio: Buffer,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const CHUNK_BYTES = 3200; // 100ms @ 16kHz PCM16 mono
+    for (let i = 0; i < pcmAudio.length; i += CHUNK_BYTES) {
+      if (signal.aborted || session.closed) {
+        break;
+      }
+      const chunk = pcmAudio.subarray(i, Math.min(i + CHUNK_BYTES, pcmAudio.length));
+      sendMessage(session.ws, { type: "audio", data: chunk.toString("base64") });
+      await sleep(100);
+    }
+  }
+
+  private startFiller(session: WebCallSession): void {
+    if (!this.fillerEnabled || session.closed) {
+      return;
+    }
+
+    this.stopFiller(session, false);
+
+    session.fillerTimer = setTimeout(() => {
+      session.fillerTimer = null;
+      if (session.closed) {
+        return;
+      }
+
+      const controller = new AbortController();
+      session.fillerController = controller;
+      void this.playFiller(session, controller.signal).finally(() => {
+        if (session.fillerController === controller) {
+          session.fillerController = null;
+        }
+      });
+    }, this.fillerThresholdMs);
+  }
+
+  private stopFiller(session: WebCallSession, clearAudio: boolean): void {
+    if (session.fillerTimer) {
+      clearTimeout(session.fillerTimer);
+      session.fillerTimer = null;
+    }
+    if (session.fillerController) {
+      session.fillerController.abort();
+      session.fillerController = null;
+    }
+    if (clearAudio) {
+      sendMessage(session.ws, { type: "audio_clear" });
+    }
+  }
+
+  private async playFiller(session: WebCallSession, signal: AbortSignal): Promise<void> {
+    const clips = loadWebFillerClips(2);
+    const clipNames = this.fillerSfxSet === "processing" ? ["processing"] : ["typing"];
+    const CHUNK_BYTES = 3200; // 100ms @ 16kHz PCM16 mono
+
+    try {
+      while (!signal.aborted && !session.closed) {
+        const name = clipNames[Math.floor(Math.random() * clipNames.length)];
+        const clip = name ? clips.get(name) : undefined;
+        if (!clip) {
+          return;
+        }
+
+        for (let i = 0; i < clip.length && !signal.aborted && !session.closed; i += CHUNK_BYTES) {
+          const chunk = clip.subarray(i, Math.min(i + CHUNK_BYTES, clip.length));
+          sendMessage(session.ws, { type: "audio", data: chunk.toString("base64") });
+          await sleep(100);
+        }
+
+        if (!signal.aborted) {
+          await sleep(500);
+        }
+      }
+    } catch {
+      // aborted/closed
     }
   }
 
@@ -329,13 +490,16 @@ export class WebCallHandler {
    */
   private endSession(sessionId: string): void {
     const session = this.sessions.get(sessionId);
-    if (!session || session.closed) return;
+    if (!session || session.closed) {
+      return;
+    }
 
     session.closed = true;
     console.log(`[web-call] Ending session: ${sessionId}`);
 
     // Cancel any in-progress response
     session.responseController?.abort();
+    this.stopFiller(session, false);
 
     // Close STT
     session.sttSession.close();

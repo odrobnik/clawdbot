@@ -35,7 +35,7 @@ function createBaseConfig(provider: "telnyx" | "twilio" | "plivo" | "mock"): Voi
       maxPendingConnectionsPerIp: 4,
       maxConnections: 128,
     },
-    web: { enabled: false, path: "/voice/web" },
+    web: { enabled: false, path: "/voice/web", audioFormat: "ulaw8k" },
     skipSignatureVerification: false,
     stt: { provider: "openai", model: "whisper-1" },
     tts: {

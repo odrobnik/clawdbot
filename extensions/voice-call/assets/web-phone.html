@@ -9,7 +9,8 @@
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); display: flex; justify-content: center; align-items: center; min-height: 100vh; }
   .container { width: 100%; max-width: 440px; padding: 24px; }
-  h1 { font-size: 1.3rem; font-weight: 600; margin-bottom: 20px; text-align: center; color: var(--muted); }
+  h1 { font-size: 1.3rem; font-weight: 600; margin-bottom: 6px; text-align: center; color: var(--muted); }
+  .build { text-align: center; color: var(--muted); font-size: 0.72rem; margin-bottom: 14px; opacity: 0.85; }
   .status-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; padding: 10px 14px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; font-size: 0.85rem; }
   .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
   .status-dot.connected { background: var(--green); }
@@ -23,6 +24,7 @@
   .msg { margin-bottom: 10px; }
   .msg.user { color: var(--green); }
   .msg.agent { color: var(--blue); }
+  .msg.partial { opacity: 0.85; font-style: italic; }
   .msg .label { font-weight: 600; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 2px; }
   .btn { display: block; width: 100%; padding: 16px; border: none; border-radius: 12px; font-size: 1.1rem; font-weight: 600; cursor: pointer; transition: background 0.2s, transform 0.1s; }
   .btn:active { transform: scale(0.98); }
@@ -36,6 +38,7 @@
 <body>
 <div class="container">
   <h1>🎙️ OpenClaw Web Phone</h1>
+  <div class="build" id="buildLabel"></div>
   <div class="status-bar">
     <div class="status-dot" id="statusDot"></div>
     <span id="statusText">Disconnected</span>
@@ -47,8 +50,16 @@
 
 <script>
 // ─── Configuration ───────────────────────────────────────────
-const WS_URL = "ws://localhost:3334/voice/web";
-const TOKEN = "";
+const WEB_PHONE_BUILD = "2026-02-19-fullband-pcm16-v1";
+const qs = new URLSearchParams(window.location.search);
+const defaultWsPath = window.location.pathname.endsWith('/phone')
+  ? window.location.pathname.slice(0, -6)
+  : '/voice/web';
+const wsScheme = window.location.protocol === 'https:' ? 'wss' : 'ws';
+const WS_URL = window.location.host
+  ? `${wsScheme}://${window.location.host}${defaultWsPath}`
+  : 'ws://localhost:3334/voice/web';
+const TOKEN = qs.get('token') || '';
 // ─────────────────────────────────────────────────────────────
 
 const TARGET_SAMPLE_RATE = 16000;
@@ -59,12 +70,17 @@ let scriptNode = null;
 let connected = false;
 let audioQueue = [];
 let isPlaying = false;
+let currentSource = null;
+let lastFinalUserText = '';
 
 const btn = document.getElementById('callBtn');
 const transcript = document.getElementById('transcript');
 const statusDot = document.getElementById('statusDot');
 const statusText = document.getElementById('statusText');
 const stateLabel = document.getElementById('stateLabel');
+const buildLabel = document.getElementById('buildLabel');
+
+buildLabel.textContent = `${WEB_PHONE_BUILD} • ${WS_URL}`;
 
 function toggleCall() {
   if (connected) hangup(); else startCall();
@@ -76,6 +92,7 @@ async function startCall() {
   transcript.innerHTML = '';
   audioQueue = [];
   isPlaying = false;
+  lastFinalUserText = '';
 
   try {
     micStream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: TARGET_SAMPLE_RATE, channelCount: 1, echoCancellation: true, noiseSuppression: true } });
@@ -104,6 +121,7 @@ async function startCall() {
       const msg = JSON.parse(evt.data);
       switch (msg.type) {
         case 'audio': queueAudio(msg.data); break;
+        case 'audio_clear': clearAudioPlayback(); break;
         case 'transcript': addTranscript(msg.text, msg.role, msg.final); break;
         case 'state': setState(msg.value); break;
         case 'ended': hangup(); break;
@@ -134,8 +152,7 @@ function cleanup() {
   if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; }
   if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
   if (ws) { ws.close(); ws = null; }
-  audioQueue = [];
-  isPlaying = false;
+  clearAudioPlayback();
   statusDot.className = 'status-dot';
   statusText.textContent = 'Disconnected';
   stateLabel.textContent = '';
@@ -177,6 +194,15 @@ function startMicCapture() {
   scriptNode.connect(audioCtx.destination); // required for onaudioprocess to fire
 }
 
+function clearAudioPlayback() {
+  audioQueue = [];
+  isPlaying = false;
+  if (currentSource) {
+    try { currentSource.onended = null; currentSource.stop(); } catch {}
+    currentSource = null;
+  }
+}
+
 function queueAudio(base64) {
   // Decode base64 PCM 16kHz 16-bit mono
   const raw = atob(base64);
@@ -210,13 +236,23 @@ function playNext() {
   const buf = audioCtx.createBuffer(1, resampled.length, outSR);
   buf.getChannelData(0).set(resampled);
   const src = audioCtx.createBufferSource();
+  currentSource = src;
   src.buffer = buf;
   src.connect(audioCtx.destination);
-  src.onended = () => playNext();
+  src.onended = () => {
+    if (currentSource === src) currentSource = null;
+    playNext();
+  };
   src.start();
 }
 
+function normalizeTranscriptText(value) {
+  return (value || '').trim().replace(/\s+/g, ' ');
+}
+
 function addTranscript(text, role, final) {
+  const normalized = normalizeTranscriptText(text);
+
   // For non-final user partials, update the existing partial element in-place
   if (role === 'user' && !final) {
     let partial = transcript.querySelector('.msg.user.partial');
@@ -232,20 +268,32 @@ function addTranscript(text, role, final) {
       partial.appendChild(body);
       transcript.appendChild(partial);
     }
-    partial.lastElementChild.textContent = text;
+
+    if (normalizeTranscriptText(partial.lastElementChild.textContent) !== normalized) {
+      partial.lastElementChild.textContent = text;
+    }
     transcript.scrollTop = transcript.scrollHeight;
     return;
   }
 
-  // Final user transcript: replace existing partial if present
   if (role === 'user' && final) {
+    // De-dupe duplicated final user events from STT/providers.
+    if (normalized && normalized === lastFinalUserText) {
+      const stalePartial = transcript.querySelector('.msg.user.partial');
+      if (stalePartial) stalePartial.remove();
+      return;
+    }
+
     const partial = transcript.querySelector('.msg.user.partial');
     if (partial) {
       partial.classList.remove('partial');
       partial.lastElementChild.textContent = text;
+      lastFinalUserText = normalized;
       transcript.scrollTop = transcript.scrollHeight;
       return;
     }
+
+    lastFinalUserText = normalized;
   }
 
   // Agent transcripts (always final) or final user with no preceding partial
