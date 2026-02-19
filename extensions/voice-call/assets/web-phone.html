@@ -104,7 +104,7 @@ async function startCall() {
       const msg = JSON.parse(evt.data);
       switch (msg.type) {
         case 'audio': queueAudio(msg.data); break;
-        case 'transcript': addTranscript(msg.text, msg.role); break;
+        case 'transcript': addTranscript(msg.text, msg.role, msg.final); break;
         case 'state': setState(msg.value); break;
         case 'ended': hangup(); break;
       }
@@ -216,7 +216,39 @@ function playNext() {
   src.start();
 }
 
-function addTranscript(text, role) {
+function addTranscript(text, role, final) {
+  // For non-final user partials, update the existing partial element in-place
+  if (role === 'user' && !final) {
+    let partial = transcript.querySelector('.msg.user.partial');
+    if (!partial) {
+      partial = document.createElement('div');
+      partial.className = 'msg user partial';
+      const label = document.createElement('div');
+      label.className = 'label';
+      label.textContent = 'You';
+      partial.appendChild(label);
+      const body = document.createElement('div');
+      body.appendChild(document.createTextNode(''));
+      partial.appendChild(body);
+      transcript.appendChild(partial);
+    }
+    partial.lastElementChild.textContent = text;
+    transcript.scrollTop = transcript.scrollHeight;
+    return;
+  }
+
+  // Final user transcript: replace existing partial if present
+  if (role === 'user' && final) {
+    const partial = transcript.querySelector('.msg.user.partial');
+    if (partial) {
+      partial.classList.remove('partial');
+      partial.lastElementChild.textContent = text;
+      transcript.scrollTop = transcript.scrollHeight;
+      return;
+    }
+  }
+
+  // Agent transcripts (always final) or final user with no preceding partial
   const div = document.createElement('div');
   div.className = `msg ${role}`;
   const label = document.createElement('div');

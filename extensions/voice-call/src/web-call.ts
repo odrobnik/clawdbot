@@ -30,7 +30,7 @@ type WebClientMessage = { type: "audio"; data: string } | { type: "hangup" };
 /** Outgoing messages to the browser */
 type WebServerMessage =
   | { type: "audio"; data: string }
-  | { type: "transcript"; text: string; role: "user" | "agent" }
+  | { type: "transcript"; text: string; role: "user" | "agent"; final: boolean }
   | { type: "state"; value: "listening" | "thinking" | "speaking" }
   | { type: "ended" };
 
@@ -166,12 +166,12 @@ export class WebCallHandler {
 
     // Wire STT callbacks
     sttSession.onPartial((partial) => {
-      sendMessage(ws, { type: "transcript", text: partial, role: "user" });
+      sendMessage(ws, { type: "transcript", text: partial, role: "user", final: false });
     });
 
     sttSession.onTranscript((transcript) => {
       console.log(`[web-call] Transcript for ${sessionId}: ${transcript}`);
-      sendMessage(ws, { type: "transcript", text: transcript, role: "user" });
+      sendMessage(ws, { type: "transcript", text: transcript, role: "user", final: true });
       sendMessage(ws, { type: "state", value: "thinking" });
 
       // Generate and speak response
@@ -256,7 +256,12 @@ export class WebCallHandler {
 
       if (result.text) {
         console.log(`[web-call] AI response for ${session.id}: "${result.text}"`);
-        sendMessage(session.ws, { type: "transcript", text: result.text, role: "agent" });
+        sendMessage(session.ws, {
+          type: "transcript",
+          text: result.text,
+          role: "agent",
+          final: true,
+        });
         sendMessage(session.ws, { type: "state", value: "speaking" });
 
         // Stream TTS audio to browser
