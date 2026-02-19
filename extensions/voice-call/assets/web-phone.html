@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OpenClaw Web Phone</title>
+<style>
+  :root { --bg: #0f0f0f; --surface: #1a1a1a; --border: #2a2a2a; --text: #e0e0e0; --muted: #888; --green: #22c55e; --red: #ef4444; --blue: #3b82f6; --amber: #f59e0b; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+  .container { width: 100%; max-width: 440px; padding: 24px; }
+  h1 { font-size: 1.3rem; font-weight: 600; margin-bottom: 20px; text-align: center; color: var(--muted); }
+  .status-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; padding: 10px 14px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; font-size: 0.85rem; }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
+  .status-dot.connected { background: var(--green); }
+  .status-dot.error { background: var(--red); }
+  .state-label { margin-left: auto; color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  .state-label.listening { color: var(--green); }
+  .state-label.thinking { color: var(--amber); }
+  .state-label.speaking { color: var(--blue); }
+  .transcript { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; height: 340px; overflow-y: auto; padding: 14px; margin-bottom: 16px; font-size: 0.9rem; line-height: 1.5; }
+  .transcript:empty::before { content: 'Conversation will appear here…'; color: var(--muted); font-style: italic; }
+  .msg { margin-bottom: 10px; }
+  .msg.user { color: var(--green); }
+  .msg.agent { color: var(--blue); }
+  .msg .label { font-weight: 600; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 2px; }
+  .btn { display: block; width: 100%; padding: 16px; border: none; border-radius: 12px; font-size: 1.1rem; font-weight: 600; cursor: pointer; transition: background 0.2s, transform 0.1s; }
+  .btn:active { transform: scale(0.98); }
+  .btn-call { background: var(--green); color: #000; }
+  .btn-call:hover { background: #16a34a; }
+  .btn-hangup { background: var(--red); color: #fff; }
+  .btn-hangup:hover { background: #dc2626; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>🎙️ OpenClaw Web Phone</h1>
+  <div class="status-bar">
+    <div class="status-dot" id="statusDot"></div>
+    <span id="statusText">Disconnected</span>
+    <span class="state-label" id="stateLabel"></span>
+  </div>
+  <div class="transcript" id="transcript"></div>
+  <button class="btn btn-call" id="callBtn" onclick="toggleCall()">🎤 Call</button>
+</div>
+
+<script>
+// ─── Configuration ───────────────────────────────────────────
+const WS_URL = "ws://localhost:3334/voice/web";
+const TOKEN = "";
+// ─────────────────────────────────────────────────────────────
+
+const TARGET_SAMPLE_RATE = 16000;
+let ws = null;
+let audioCtx = null;
+let micStream = null;
+let scriptNode = null;
+let connected = false;
+let audioQueue = [];
+let isPlaying = false;
+
+const btn = document.getElementById('callBtn');
+const transcript = document.getElementById('transcript');
+const statusDot = document.getElementById('statusDot');
+const statusText = document.getElementById('statusText');
+const stateLabel = document.getElementById('stateLabel');
+
+function toggleCall() {
+  if (connected) hangup(); else startCall();
+}
+
+async function startCall() {
+  btn.disabled = true;
+  statusText.textContent = 'Connecting…';
+  transcript.innerHTML = '';
+  audioQueue = [];
+  isPlaying = false;
+
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: TARGET_SAMPLE_RATE, channelCount: 1, echoCancellation: true, noiseSuppression: true } });
+  } catch (e) {
+    statusText.textContent = 'Microphone access denied';
+    statusDot.className = 'status-dot error';
+    btn.disabled = false;
+    return;
+  }
+
+  const url = TOKEN ? `${WS_URL}?token=${encodeURIComponent(TOKEN)}` : WS_URL;
+  ws = new WebSocket(url);
+
+  ws.onopen = () => {
+    connected = true;
+    statusDot.className = 'status-dot connected';
+    statusText.textContent = 'Connected';
+    btn.textContent = '📞 Hang Up';
+    btn.className = 'btn btn-hangup';
+    btn.disabled = false;
+    startMicCapture();
+  };
+
+  ws.onmessage = (evt) => {
+    try {
+      const msg = JSON.parse(evt.data);
+      switch (msg.type) {
+        case 'audio': queueAudio(msg.data); break;
+        case 'transcript': addTranscript(msg.text, msg.role); break;
+        case 'state': setState(msg.value); break;
+        case 'ended': hangup(); break;
+      }
+    } catch (e) { console.error('Parse error:', e); }
+  };
+
+  ws.onerror = () => {
+    statusText.textContent = 'Connection error';
+    statusDot.className = 'status-dot error';
+  };
+
+  ws.onclose = () => {
+    if (connected) hangup();
+  };
+}
+
+function hangup() {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try { ws.send(JSON.stringify({ type: 'hangup' })); } catch {}
+  }
+  cleanup();
+}
+
+function cleanup() {
+  connected = false;
+  if (scriptNode) { scriptNode.disconnect(); scriptNode = null; }
+  if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; }
+  if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+  if (ws) { ws.close(); ws = null; }
+  audioQueue = [];
+  isPlaying = false;
+  statusDot.className = 'status-dot';
+  statusText.textContent = 'Disconnected';
+  stateLabel.textContent = '';
+  stateLabel.className = 'state-label';
+  btn.textContent = '🎤 Call';
+  btn.className = 'btn btn-call';
+  btn.disabled = false;
+}
+
+function startMicCapture() {
+  audioCtx = new AudioContext({ sampleRate: 48000 });
+  const source = audioCtx.createMediaStreamSource(micStream);
+  // Use ScriptProcessorNode for broad compatibility
+  const bufSize = 4096;
+  scriptNode = audioCtx.createScriptProcessor(bufSize, 1, 1);
+  const nativeSR = audioCtx.sampleRate;
+
+  scriptNode.onaudioprocess = (e) => {
+    if (!connected || !ws || ws.readyState !== WebSocket.OPEN) return;
+    const input = e.inputBuffer.getChannelData(0);
+    // Resample to 16kHz
+    const ratio = nativeSR / TARGET_SAMPLE_RATE;
+    const outLen = Math.floor(input.length / ratio);
+    const pcm16 = new Int16Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const srcPos = i * ratio;
+      const idx = Math.floor(srcPos);
+      const frac = srcPos - idx;
+      const s0 = input[idx] || 0;
+      const s1 = input[Math.min(idx + 1, input.length - 1)] || 0;
+      const val = s0 + frac * (s1 - s0);
+      pcm16[i] = Math.max(-32768, Math.min(32767, Math.round(val * 32767)));
+    }
+    const bytes = new Uint8Array(pcm16.buffer);
+    ws.send(JSON.stringify({ type: 'audio', data: btoa(String.fromCharCode(...bytes)) }));
+  };
+
+  source.connect(scriptNode);
+  scriptNode.connect(audioCtx.destination); // required for onaudioprocess to fire
+}
+
+function queueAudio(base64) {
+  // Decode base64 PCM 16kHz 16-bit mono
+  const raw = atob(base64);
+  const bytes = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+  const pcm16 = new Int16Array(bytes.buffer);
+  // Convert to float32
+  const float32 = new Float32Array(pcm16.length);
+  for (let i = 0; i < pcm16.length; i++) float32[i] = pcm16[i] / 32768;
+  audioQueue.push(float32);
+  if (!isPlaying) playNext();
+}
+
+function playNext() {
+  if (!audioCtx || audioQueue.length === 0) { isPlaying = false; return; }
+  isPlaying = true;
+  const samples = audioQueue.shift();
+  // Resample 16kHz → audioCtx.sampleRate for playback
+  const outSR = audioCtx.sampleRate;
+  const ratio = 16000 / outSR;
+  const outLen = Math.round(samples.length / ratio);
+  const resampled = new Float32Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const srcPos = i * ratio;
+    const idx = Math.floor(srcPos);
+    const frac = srcPos - idx;
+    const s0 = samples[idx] || 0;
+    const s1 = samples[Math.min(idx + 1, samples.length - 1)] || 0;
+    resampled[i] = s0 + frac * (s1 - s0);
+  }
+  const buf = audioCtx.createBuffer(1, resampled.length, outSR);
+  buf.getChannelData(0).set(resampled);
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(audioCtx.destination);
+  src.onended = () => playNext();
+  src.start();
+}
+
+function addTranscript(text, role) {
+  const div = document.createElement('div');
+  div.className = `msg ${role}`;
+  const label = document.createElement('div');
+  label.className = 'label';
+  label.textContent = role === 'user' ? 'You' : 'Agent';
+  const body = document.createElement('div');
+  body.textContent = text;
+  div.appendChild(label);
+  div.appendChild(body);
+  transcript.appendChild(div);
+  transcript.scrollTop = transcript.scrollHeight;
+}
+
+function setState(value) {
+  stateLabel.textContent = value;
+  stateLabel.className = `state-label ${value}`;
+}
+</script>
+</body>
+</html>

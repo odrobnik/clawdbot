@@ -251,6 +251,23 @@ export const VoiceCallStreamingConfigSchema = z
 export type VoiceCallStreamingConfig = z.infer<typeof VoiceCallStreamingConfigSchema>;
 
 // -----------------------------------------------------------------------------
+// Web Phone Configuration
+// -----------------------------------------------------------------------------
+
+export const VoiceCallWebConfigSchema = z
+  .object({
+    /** Enable web phone (browser-based calling) */
+    enabled: z.boolean().default(false),
+    /** Authentication token for WebSocket connections (required when enabled) */
+    token: z.string().min(1).optional(),
+    /** WebSocket path for web phone connections */
+    path: z.string().min(1).default("/voice/web"),
+  })
+  .strict()
+  .default({ enabled: false, path: "/voice/web" });
+export type VoiceCallWebConfig = z.infer<typeof VoiceCallWebConfigSchema>;
+
+// -----------------------------------------------------------------------------
 // Main Voice Call Configuration
 // -----------------------------------------------------------------------------
 
@@ -326,6 +343,9 @@ export const VoiceCallConfigSchema = z
 
     /** Real-time audio streaming configuration */
     streaming: VoiceCallStreamingConfigSchema,
+
+    /** Web phone (browser-based calling) configuration */
+    web: VoiceCallWebConfigSchema,
 
     /** Public webhook URL override (if set, bypasses tunnel auto-detection) */
     publicUrl: z.string().url().optional(),

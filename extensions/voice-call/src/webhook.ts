@@ -16,7 +16,9 @@ import { ElevenLabsScribeSTTProvider } from "./providers/stt-elevenlabs-scribe.j
 import { OpenAIRealtimeSTTProvider } from "./providers/stt-openai-realtime.js";
 import type { TwilioProvider } from "./providers/twilio.js";
 import { SilenceFiller } from "./silence-filler.js";
+import type { TelephonyTtsProvider } from "./telephony-tts.js";
 import type { NormalizedEvent, WebhookContext } from "./types.js";
+import { WebCallHandler } from "./web-call.js";
 
 const MAX_WEBHOOK_BODY_BYTES = 1024 * 1024;
 
@@ -41,6 +43,9 @@ export class VoiceCallWebhookServer {
   /** Maps callSid → streamSid for silence filler routing */
   private callStreamSids = new Map<string, string>();
 
+  /** Web call handler for browser-based calls */
+  private webCallHandler: WebCallHandler | null = null;
+
   constructor(
     config: VoiceCallConfig,
     manager: CallManager,
@@ -63,6 +68,20 @@ export class VoiceCallWebhookServer {
    */
   getMediaStreamHandler(): MediaStreamHandler | null {
     return this.mediaStreamHandler;
+  }
+
+  /**
+   * Set the web call handler (for browser-based calls).
+   */
+  setWebCallHandler(handler: WebCallHandler): void {
+    this.webCallHandler = handler;
+  }
+
+  /**
+   * Get the web call handler.
+   */
+  getWebCallHandler(): WebCallHandler | null {
+    return this.webCallHandler;
   }
 
   /**
@@ -256,18 +275,22 @@ export class VoiceCallWebhookServer {
         });
       });
 
-      // Handle WebSocket upgrades for media streams
-      if (this.mediaStreamHandler) {
-        this.server.on("upgrade", (request, socket, head) => {
-          const path = this.getUpgradePathname(request);
-          if (path === streamPath) {
-            console.log("[voice-call] WebSocket upgrade for media stream");
-            this.mediaStreamHandler?.handleUpgrade(request, socket, head);
-          } else {
-            socket.destroy();
-          }
-        });
-      }
+      // Handle WebSocket upgrades for media streams and web calls
+      const webPath = this.config.web?.path || "/voice/web";
+
+      this.server.on("upgrade", (request, socket, head) => {
+        const url = new URL(request.url || "/", `http://${request.headers.host}`);
+
+        if (url.pathname === streamPath && this.mediaStreamHandler) {
+          console.log("[voice-call] WebSocket upgrade for media stream");
+          this.mediaStreamHandler.handleUpgrade(request, socket, head);
+        } else if (url.pathname === webPath && this.webCallHandler) {
+          console.log("[voice-call] WebSocket upgrade for web call");
+          this.webCallHandler.handleUpgrade(request, socket, head);
+        } else {
+          socket.destroy();
+        }
+      });
 
       this.server.on("error", reject);
 
@@ -276,6 +299,9 @@ export class VoiceCallWebhookServer {
         console.log(`[voice-call] Webhook server listening on ${url}`);
         if (this.mediaStreamHandler) {
           console.log(`[voice-call] Media stream WebSocket on ws://${bind}:${port}${streamPath}`);
+        }
+        if (this.webCallHandler) {
+          console.log(`[voice-call] Web phone WebSocket on ws://${bind}:${port}${webPath}`);
         }
         resolve(url);
 

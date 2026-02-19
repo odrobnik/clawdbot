@@ -10,6 +10,7 @@ import { TwilioProvider } from "./providers/twilio.js";
 import type { TelephonyTtsRuntime } from "./telephony-tts.js";
 import { createTelephonyTtsProvider } from "./telephony-tts.js";
 import { startTunnel, type TunnelResult } from "./tunnel.js";
+import { WebCallHandler } from "./web-call.js";
 import {
   cleanupTailscaleExposure,
   setupTailscaleExposure,
@@ -189,9 +190,88 @@ export async function createVoiceCallRuntime(params: {
     }
   }
 
+  // Web phone (browser-based calling)
+  if (config.web?.enabled && config.streaming?.enabled && ttsRuntime?.textToSpeechTelephony) {
+    const sttProviderType = config.streaming?.sttProvider ?? "openai-realtime";
+
+    let webSttProvider:
+      | import("./providers/stt-openai-realtime.js").OpenAIRealtimeSTTProvider
+      | import("./providers/stt-elevenlabs-scribe.js").ElevenLabsScribeSTTProvider
+      | null = null;
+
+    if (sttProviderType === "elevenlabs-scribe") {
+      const apiKey =
+        config.streaming?.elevenlabsApiKey ||
+        config.tts?.elevenlabs?.apiKey ||
+        process.env.ELEVENLABS_API_KEY;
+      if (apiKey) {
+        const { ElevenLabsScribeSTTProvider } =
+          await import("./providers/stt-elevenlabs-scribe.js");
+        webSttProvider = new ElevenLabsScribeSTTProvider({
+          apiKey,
+          languageCode: config.streaming?.elevenlabsLanguageCode,
+          vadSilenceThresholdSecs: config.streaming?.silenceDurationMs
+            ? config.streaming.silenceDurationMs / 1000
+            : undefined,
+          vadThreshold: config.streaming?.vadThreshold,
+        });
+      }
+    } else {
+      const apiKey = config.streaming?.openaiApiKey || process.env.OPENAI_API_KEY;
+      if (apiKey) {
+        const { OpenAIRealtimeSTTProvider } = await import("./providers/stt-openai-realtime.js");
+        webSttProvider = new OpenAIRealtimeSTTProvider({
+          apiKey,
+          model: config.streaming?.sttModel,
+          silenceDurationMs: config.streaming?.silenceDurationMs,
+          vadThreshold: config.streaming?.vadThreshold,
+        });
+      }
+    }
+
+    if (webSttProvider) {
+      try {
+        const webTtsProvider = createTelephonyTtsProvider({
+          coreConfig,
+          ttsOverride: config.tts,
+          runtime: ttsRuntime,
+        });
+
+        const webCallHandler = new WebCallHandler({
+          config,
+          coreConfig,
+          sttProvider: webSttProvider,
+          ttsProvider: webTtsProvider,
+          onAutoRespond: async () => {
+            // Response generation is handled internally by WebCallHandler
+          },
+        });
+
+        webhookServer.setWebCallHandler(webCallHandler);
+        log.info("[voice-call] Web phone enabled");
+      } catch (err) {
+        log.warn(
+          `[voice-call] Failed to initialize web phone: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    } else {
+      log.warn("[voice-call] Web phone enabled but no STT provider available");
+    }
+  } else if (config.web?.enabled) {
+    log.warn(
+      "[voice-call] Web phone enabled but streaming not configured or TTS runtime unavailable",
+    );
+  }
+
   manager.initialize(provider, webhookUrl);
 
   const stop = async () => {
+    const webHandler = webhookServer.getWebCallHandler();
+    if (webHandler) {
+      webHandler.closeAll();
+    }
     if (tunnelResult) {
       await tunnelResult.stop();
     }
