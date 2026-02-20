@@ -60,6 +60,7 @@ const WS_URL = window.location.host
   ? `${wsScheme}://${window.location.host}${defaultWsPath}`
   : 'ws://localhost:3334/voice/web';
 const TOKEN = qs.get('token') || '';
+const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 // ─────────────────────────────────────────────────────────────
 
 const TARGET_SAMPLE_RATE = 16000;
@@ -206,6 +207,8 @@ let scriptNode = null;
 let playbackNode = null;
 let connected = false;
 let lastFinalUserText = '';
+let speechRecog = null;
+let speechRecogShouldRestart = false;
 
 const btn = document.getElementById('callBtn');
 const transcript = document.getElementById('transcript');
@@ -260,6 +263,7 @@ async function startCall() {
     btn.textContent = '📞 Hang Up';
     btn.className = 'btn btn-hangup';
     btn.disabled = false;
+    startSpeechRecognition();
   };
 
   ws.onmessage = (evt) => {
@@ -286,6 +290,7 @@ async function startCall() {
 }
 
 function hangup() {
+  stopSpeechRecognition();
   if (ws && ws.readyState === WebSocket.OPEN) {
     try { ws.send(JSON.stringify({ type: 'hangup' })); } catch {}
   }
@@ -294,6 +299,7 @@ function hangup() {
 
 function cleanup() {
   connected = false;
+  stopSpeechRecognition();
   if (scriptNode) { scriptNode.disconnect(); scriptNode = null; }
   clearAudioPlayback();
   if (playbackNode) { playbackNode.disconnect(); playbackNode = null; }
@@ -406,6 +412,72 @@ async function createPlaybackNode(ctx) {
 
 function normalizeTranscriptText(value) {
   return (value || '').trim().replace(/\s+/g, ' ');
+}
+
+function restartSpeechRecognition() {
+  if (!speechRecog || !speechRecogShouldRestart || !connected) return;
+  try {
+    speechRecog.start();
+  } catch (error) {
+    const errorName = error && error.name ? error.name : '';
+    if (errorName !== 'InvalidStateError') {
+      console.warn('SpeechRecognition restart failed:', error);
+    }
+  }
+}
+
+function startSpeechRecognition() {
+  if (!SpeechRecognition || !connected) return;
+
+  if (!speechRecog) {
+    speechRecog = new SpeechRecognition();
+    speechRecog.continuous = true;
+    speechRecog.interimResults = true;
+    speechRecog.lang = 'en-US';
+
+    speechRecog.onresult = (event) => {
+      if (!connected) return;
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const result = event.results[i];
+        if (result.isFinal) continue;
+        const transcriptText = result[0] && result[0].transcript ? result[0].transcript : '';
+        if (normalizeTranscriptText(transcriptText)) {
+          addTranscript(transcriptText, 'user', false);
+        }
+      }
+    };
+
+    speechRecog.onend = () => {
+      if (!speechRecogShouldRestart || !connected) return;
+      restartSpeechRecognition();
+    };
+
+    speechRecog.onerror = (event) => {
+      const errorCode = event && event.error ? event.error : 'unknown';
+      console.warn('SpeechRecognition error:', errorCode);
+      if (errorCode === 'not-allowed' || errorCode === 'service-not-allowed') {
+        speechRecogShouldRestart = false;
+        return;
+      }
+      if (!speechRecogShouldRestart || !connected) return;
+      if (errorCode === 'no-speech' || errorCode === 'aborted' || errorCode === 'audio-capture' || errorCode === 'network') {
+        restartSpeechRecognition();
+      }
+    };
+  }
+
+  speechRecogShouldRestart = true;
+  restartSpeechRecognition();
+}
+
+function stopSpeechRecognition() {
+  speechRecogShouldRestart = false;
+  if (!speechRecog) return;
+  speechRecog.onresult = null;
+  speechRecog.onend = null;
+  speechRecog.onerror = null;
+  try { speechRecog.stop(); } catch {}
+  speechRecog = null;
 }
 
 function addTranscript(text, role, final) {
