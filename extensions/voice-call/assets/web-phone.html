@@ -24,7 +24,10 @@
   .msg { margin-bottom: 10px; }
   .msg.user { color: var(--green); }
   .msg.agent { color: var(--blue); }
-  .msg.partial { }
+  .typing-dots span { animation: blink 1.4s infinite both; }
+  .typing-dots span:nth-child(2) { animation-delay: 0.2s; }
+  .typing-dots span:nth-child(3) { animation-delay: 0.4s; }
+  @keyframes blink { 0%, 80%, 100% { opacity: 0.2; } 40% { opacity: 1; } }
   .msg .label { font-weight: 600; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 2px; }
   .btn { display: block; width: 100%; padding: 16px; border: none; border-radius: 12px; font-size: 1.1rem; font-weight: 600; cursor: pointer; transition: background 0.2s, transform 0.1s; }
   .btn:active { transform: scale(0.98); }
@@ -60,7 +63,6 @@ const WS_URL = window.location.host
   ? `${wsScheme}://${window.location.host}${defaultWsPath}`
   : 'ws://localhost:3334/voice/web';
 const TOKEN = qs.get('token') || '';
-const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 // ─────────────────────────────────────────────────────────────
 
 const TARGET_SAMPLE_RATE = 16000;
@@ -207,9 +209,6 @@ let scriptNode = null;
 let playbackNode = null;
 let connected = false;
 let lastFinalUserText = '';
-let speechRecog = null;
-let speechRecogShouldRestart = false;
-let speechRecogMuted = false;
 
 const btn = document.getElementById('callBtn');
 const transcript = document.getElementById('transcript');
@@ -264,7 +263,6 @@ async function startCall() {
     btn.textContent = '📞 Hang Up';
     btn.className = 'btn btn-hangup';
     btn.disabled = false;
-    startSpeechRecognition();
   };
 
   ws.onmessage = (evt) => {
@@ -274,6 +272,7 @@ async function startCall() {
         case 'audio': queueAudio(msg.data); break;
         case 'audio_clear': clearAudioPlayback(); break;
         case 'transcript': addTranscript(msg.text, msg.role, msg.final); break;
+        case 'speech_started': showTypingIndicator(); break;
         case 'state': setState(msg.value); break;
         case 'ended': hangup(); break;
       }
@@ -291,7 +290,6 @@ async function startCall() {
 }
 
 function hangup() {
-  stopSpeechRecognition();
   if (ws && ws.readyState === WebSocket.OPEN) {
     try { ws.send(JSON.stringify({ type: 'hangup' })); } catch {}
   }
@@ -300,7 +298,6 @@ function hangup() {
 
 function cleanup() {
   connected = false;
-  stopSpeechRecognition();
   if (scriptNode) { scriptNode.disconnect(); scriptNode = null; }
   clearAudioPlayback();
   if (playbackNode) { playbackNode.disconnect(); playbackNode = null; }
@@ -415,79 +412,22 @@ function normalizeTranscriptText(value) {
   return (value || '').trim().replace(/\s+/g, ' ');
 }
 
-function restartSpeechRecognition() {
-  if (!speechRecog || !speechRecogShouldRestart || !connected) return;
-  speechRecogMuted = false;
-  try {
-    speechRecog.start();
-  } catch (error) {
-    const errorName = error && error.name ? error.name : '';
-    if (errorName !== 'InvalidStateError') {
-      console.warn('SpeechRecognition restart failed:', error);
-    }
-  }
-}
-
-function startSpeechRecognition() {
-  if (!SpeechRecognition || !connected) return;
-
-  if (!speechRecog) {
-    speechRecog = new SpeechRecognition();
-    speechRecog.continuous = true;
-    speechRecog.interimResults = true;
-
-    speechRecog.onresult = (event) => {
-      if (!connected || speechRecogMuted) return;
-      // Concatenate all results (final phrases + current interim) into one string
-      let full = '';
-      for (let i = 0; i < event.results.length; i++) {
-        const alt = event.results[i][0];
-        if (alt && alt.transcript) full += alt.transcript;
-      }
-      if (normalizeTranscriptText(full)) {
-        addTranscript(full, 'user', false);
-      }
-    };
-
-    speechRecog.onend = () => {
-      if (!speechRecogShouldRestart || !connected) return;
-      restartSpeechRecognition();
-    };
-
-    speechRecog.onerror = (event) => {
-      const errorCode = event && event.error ? event.error : 'unknown';
-      console.warn('SpeechRecognition error:', errorCode);
-      if (errorCode === 'not-allowed' || errorCode === 'service-not-allowed') {
-        speechRecogShouldRestart = false;
-        return;
-      }
-      if (!speechRecogShouldRestart || !connected) return;
-      if (errorCode === 'no-speech' || errorCode === 'aborted' || errorCode === 'audio-capture' || errorCode === 'network') {
-        restartSpeechRecognition();
-      }
-    };
-  }
-
-  speechRecogShouldRestart = true;
-  restartSpeechRecognition();
-}
-
-function resetSpeechRecognition() {
-  // Mute immediately to ignore any trailing events, then stop and restart
-  speechRecogMuted = true;
-  if (!speechRecog || !speechRecogShouldRestart || !connected) return;
-  try { speechRecog.stop(); } catch {}
-  // onend handler will auto-restart since speechRecogShouldRestart is true
-}
-
-function stopSpeechRecognition() {
-  speechRecogShouldRestart = false;
-  if (!speechRecog) return;
-  speechRecog.onresult = null;
-  speechRecog.onend = null;
-  speechRecog.onerror = null;
-  try { speechRecog.stop(); } catch {}
-  speechRecog = null;
+function showTypingIndicator() {
+  // Show animated dots in a partial user bubble while speaking
+  const last = transcript.lastElementChild;
+  if (last && last.classList.contains('partial')) return; // already showing
+  const div = document.createElement('div');
+  div.className = 'msg user partial';
+  const label = document.createElement('div');
+  label.className = 'label';
+  label.textContent = 'You';
+  div.appendChild(label);
+  const body = document.createElement('div');
+  body.className = 'typing-dots';
+  body.innerHTML = '<span>.</span><span>.</span><span>.</span>';
+  div.appendChild(body);
+  transcript.appendChild(div);
+  transcript.scrollTop = transcript.scrollHeight;
 }
 
 function addTranscript(text, role, final) {
@@ -519,9 +459,6 @@ function addTranscript(text, role, final) {
   }
 
   if (role === 'user' && final) {
-    // Reset browser SpeechRecognition to clear accumulated results for next turn
-    resetSpeechRecognition();
-
     // De-dupe duplicated final user events from STT/providers.
     if (normalized && normalized === lastFinalUserText) {
       const lastEl = transcript.lastElementChild;
@@ -529,11 +466,15 @@ function addTranscript(text, role, final) {
       return;
     }
 
+    // Replace typing indicator (or any partial) with final text
     const last = transcript.lastElementChild;
     const partial = last && last.classList.contains('partial') ? last : null;
     if (partial) {
       partial.classList.remove('partial');
-      partial.lastElementChild.textContent = text;
+      const body = partial.lastElementChild;
+      body.className = '';
+      body.innerHTML = '';
+      body.textContent = text;
       lastFinalUserText = normalized;
       transcript.scrollTop = transcript.scrollHeight;
       return;

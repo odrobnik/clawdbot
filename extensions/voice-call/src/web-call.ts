@@ -44,6 +44,7 @@ type WebServerMessage =
   | { type: "audio"; data: string }
   | { type: "audio_clear" }
   | { type: "transcript"; text: string; role: "user" | "agent"; final: boolean }
+  | { type: "speech_started" }
   | { type: "state"; value: "listening" | "thinking" | "speaking" }
   | { type: "ended" };
 
@@ -335,6 +336,8 @@ export class WebCallHandler {
         session.responseController = null;
       }
       this.stopFiller(session, true);
+      sendMessage(ws, { type: "audio_clear" });
+      sendMessage(ws, { type: "speech_started" });
       sendMessage(ws, { type: "state", value: "listening" });
     });
 
