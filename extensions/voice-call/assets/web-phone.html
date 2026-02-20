@@ -493,7 +493,9 @@ function addTranscript(text, role, final) {
 
   // For non-final user partials, update the existing partial element in-place
   if (role === 'user' && !final) {
-    let partial = transcript.querySelector('.msg.user.partial');
+    // Only reuse a partial if it's the last message (not followed by agent/final messages)
+    let partial = transcript.lastElementChild && transcript.lastElementChild.classList.contains('partial')
+      ? transcript.lastElementChild : null;
     if (!partial) {
       partial = document.createElement('div');
       partial.className = 'msg user partial';
@@ -520,12 +522,13 @@ function addTranscript(text, role, final) {
 
     // De-dupe duplicated final user events from STT/providers.
     if (normalized && normalized === lastFinalUserText) {
-      const stalePartial = transcript.querySelector('.msg.user.partial');
-      if (stalePartial) stalePartial.remove();
+      const lastEl = transcript.lastElementChild;
+      if (lastEl && lastEl.classList.contains('partial')) lastEl.remove();
       return;
     }
 
-    const partial = transcript.querySelector('.msg.user.partial');
+    const last = transcript.lastElementChild;
+    const partial = last && last.classList.contains('partial') ? last : null;
     if (partial) {
       partial.classList.remove('partial');
       partial.lastElementChild.textContent = text;
