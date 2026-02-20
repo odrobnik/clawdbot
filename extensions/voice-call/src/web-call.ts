@@ -314,9 +314,9 @@ export class WebCallHandler {
     this.sessions.set(sessionId, session);
 
     // Wire STT callbacks
-    sttSession.onPartial((partial) => {
-      sendMessage(ws, { type: "transcript", text: partial, role: "user", final: false });
-    });
+    // Server partials are not sent to web clients — browser SpeechRecognition
+    // handles live display. Only the final transcript is sent to avoid flicker.
+    sttSession.onPartial(() => {});
 
     sttSession.onTranscript((transcript) => {
       console.log(`[web-call] Transcript for ${sessionId}: ${transcript}`);
