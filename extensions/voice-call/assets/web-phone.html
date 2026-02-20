@@ -65,6 +65,8 @@ const TOKEN = qs.get('token') || '';
 const TARGET_SAMPLE_RATE = 16000;
 const PLAYBACK_SAFETY_SEC = 0.05;
 const PLAYBACK_FADE_SEC = 0.002;
+const MIN_START_BUFFER_SEC = 0.32;
+const TARGET_BUFFER_AHEAD_SEC = 0.8;
 const MAX_QUEUE_CHUNKS = 80;
 const MAX_BUFFER_AHEAD_SEC = 2.5;
 
@@ -74,8 +76,10 @@ let micStream = null;
 let scriptNode = null;
 let connected = false;
 let audioQueue = [];
+let queuedDurationSec = 0;
 let scheduledSources = [];
 let nextPlayTime = 0;
+let waitingForPrebuffer = true;
 let lastFinalUserText = '';
 
 const btn = document.getElementById('callBtn');
@@ -96,8 +100,10 @@ async function startCall() {
   statusText.textContent = 'Connecting…';
   transcript.innerHTML = '';
   audioQueue = [];
+  queuedDurationSec = 0;
   scheduledSources = [];
   nextPlayTime = 0;
+  waitingForPrebuffer = true;
   lastFinalUserText = '';
 
   try {
@@ -203,7 +209,9 @@ function startMicCapture() {
 
 function clearAudioPlayback() {
   audioQueue = [];
+  queuedDurationSec = 0;
   nextPlayTime = 0;
+  waitingForPrebuffer = true;
   for (const entry of scheduledSources) {
     try { entry.source.onended = null; entry.source.stop(); } catch {}
     try { entry.source.disconnect(); } catch {}
@@ -224,31 +232,49 @@ function queueAudio(base64) {
 
   if (audioQueue.length >= MAX_QUEUE_CHUNKS) {
     const drop = audioQueue.length - MAX_QUEUE_CHUNKS + 1;
-    audioQueue.splice(0, drop);
+    const dropped = audioQueue.splice(0, drop);
+    for (const chunk of dropped) queuedDurationSec -= chunk.length / TARGET_SAMPLE_RATE;
+    queuedDurationSec = Math.max(0, queuedDurationSec);
     console.warn(`[web-phone] Dropped ${drop} queued audio chunk(s) to cap backlog.`);
   }
 
   audioQueue.push(float32);
+  queuedDurationSec += float32.length / TARGET_SAMPLE_RATE;
   scheduleQueuedAudio();
 }
 
 function scheduleQueuedAudio() {
-  if (!audioCtx) return;
+  if (!audioCtx || audioQueue.length === 0) return;
 
-  if (!nextPlayTime || nextPlayTime < audioCtx.currentTime - PLAYBACK_SAFETY_SEC) {
-    nextPlayTime = audioCtx.currentTime + PLAYBACK_SAFETY_SEC;
+  const now = audioCtx.currentTime;
+  if (!nextPlayTime || nextPlayTime < now - PLAYBACK_SAFETY_SEC) {
+    nextPlayTime = now + PLAYBACK_SAFETY_SEC;
+    waitingForPrebuffer = true;
   }
 
+  const scheduledAheadSec = Math.max(0, nextPlayTime - now);
+  const totalBufferedSec = scheduledAheadSec + queuedDurationSec;
+  if (waitingForPrebuffer && totalBufferedSec < MIN_START_BUFFER_SEC) {
+    return;
+  }
+
+  waitingForPrebuffer = false;
   while (audioQueue.length > 0) {
+    const bufferAheadSec = Math.max(0, nextPlayTime - audioCtx.currentTime);
+    if (bufferAheadSec >= TARGET_BUFFER_AHEAD_SEC || bufferAheadSec >= MAX_BUFFER_AHEAD_SEC) {
+      break;
+    }
+
     const samples = audioQueue[0];
     const scheduled = scheduleChunk(samples);
     if (!scheduled) {
-      // Too much audio is already buffered ahead; drop oldest unscheduled chunk.
-      audioQueue.shift();
-      console.warn('[web-phone] Dropped stale chunk to keep playback latency bounded.');
-      continue;
+      // Keep unscheduled audio queued and wait for buffer-ahead to drain.
+      break;
     }
+
     audioQueue.shift();
+    queuedDurationSec -= samples.length / TARGET_SAMPLE_RATE;
+    queuedDurationSec = Math.max(0, queuedDurationSec);
   }
 }
 
@@ -257,7 +283,7 @@ function scheduleChunk(samples) {
 
   // Resample 16kHz → audioCtx.sampleRate for playback
   const outSR = audioCtx.sampleRate;
-  const ratio = 16000 / outSR;
+  const ratio = TARGET_SAMPLE_RATE / outSR;
   const outLen = Math.round(samples.length / ratio);
   const resampled = new Float32Array(outLen);
   for (let i = 0; i < outLen; i++) {
@@ -307,6 +333,7 @@ function scheduleChunk(samples) {
     try { source.disconnect(); } catch {}
     try { gainNode.disconnect(); } catch {}
     scheduledSources = scheduledSources.filter((item) => item !== entry);
+    scheduleQueuedAudio();
   };
 
   source.start(startTime);
