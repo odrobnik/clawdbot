@@ -437,13 +437,14 @@ function startSpeechRecognition() {
 
     speechRecog.onresult = (event) => {
       if (!connected) return;
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const result = event.results[i];
-        if (result.isFinal) continue;
-        const transcriptText = result[0] && result[0].transcript ? result[0].transcript : '';
-        if (normalizeTranscriptText(transcriptText)) {
-          addTranscript(transcriptText, 'user', false);
-        }
+      // Concatenate all results (final phrases + current interim) into one string
+      let full = '';
+      for (let i = 0; i < event.results.length; i++) {
+        const alt = event.results[i][0];
+        if (alt && alt.transcript) full += alt.transcript;
+      }
+      if (normalizeTranscriptText(full)) {
+        addTranscript(full, 'user', false);
       }
     };
 
