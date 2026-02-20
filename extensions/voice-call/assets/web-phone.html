@@ -471,6 +471,13 @@ function startSpeechRecognition() {
   restartSpeechRecognition();
 }
 
+function resetSpeechRecognition() {
+  // Stop and restart to clear accumulated results
+  if (!speechRecog || !speechRecogShouldRestart || !connected) return;
+  try { speechRecog.stop(); } catch {}
+  // onend handler will auto-restart since speechRecogShouldRestart is true
+}
+
 function stopSpeechRecognition() {
   speechRecogShouldRestart = false;
   if (!speechRecog) return;
@@ -508,6 +515,9 @@ function addTranscript(text, role, final) {
   }
 
   if (role === 'user' && final) {
+    // Reset browser SpeechRecognition to clear accumulated results for next turn
+    resetSpeechRecognition();
+
     // De-dupe duplicated final user events from STT/providers.
     if (normalized && normalized === lastFinalUserText) {
       const stalePartial = transcript.querySelector('.msg.user.partial');
