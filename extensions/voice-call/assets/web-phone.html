@@ -209,6 +209,7 @@ let connected = false;
 let lastFinalUserText = '';
 let speechRecog = null;
 let speechRecogShouldRestart = false;
+let speechRecogMuted = false;
 
 const btn = document.getElementById('callBtn');
 const transcript = document.getElementById('transcript');
@@ -416,6 +417,7 @@ function normalizeTranscriptText(value) {
 
 function restartSpeechRecognition() {
   if (!speechRecog || !speechRecogShouldRestart || !connected) return;
+  speechRecogMuted = false;
   try {
     speechRecog.start();
   } catch (error) {
@@ -436,7 +438,7 @@ function startSpeechRecognition() {
     speechRecog.lang = 'en-US';
 
     speechRecog.onresult = (event) => {
-      if (!connected) return;
+      if (!connected || speechRecogMuted) return;
       // Concatenate all results (final phrases + current interim) into one string
       let full = '';
       for (let i = 0; i < event.results.length; i++) {
@@ -472,7 +474,8 @@ function startSpeechRecognition() {
 }
 
 function resetSpeechRecognition() {
-  // Stop and restart to clear accumulated results
+  // Mute immediately to ignore any trailing events, then stop and restart
+  speechRecogMuted = true;
   if (!speechRecog || !speechRecogShouldRestart || !connected) return;
   try { speechRecog.stop(); } catch {}
   // onend handler will auto-restart since speechRecogShouldRestart is true
