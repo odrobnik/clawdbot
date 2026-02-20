@@ -64,7 +64,7 @@ const TOKEN = qs.get('token') || '';
 
 const TARGET_SAMPLE_RATE = 16000;
 const PLAYBACK_SAFETY_SEC = 0.05;
-const PLAYBACK_FADE_SEC = 0.002;
+const CROSSFADE_SAMPLES_16K = 80; // 5ms at 16kHz
 const MIN_START_BUFFER_SEC = 0.32;
 const TARGET_BUFFER_AHEAD_SEC = 0.8;
 const MAX_QUEUE_CHUNKS = 80;
@@ -81,6 +81,7 @@ let scheduledSources = [];
 let nextPlayTime = 0;
 let waitingForPrebuffer = true;
 let lastFinalUserText = '';
+let pendingPlaybackTail = null;
 
 const btn = document.getElementById('callBtn');
 const transcript = document.getElementById('transcript');
@@ -212,6 +213,7 @@ function clearAudioPlayback() {
   queuedDurationSec = 0;
   nextPlayTime = 0;
   waitingForPrebuffer = true;
+  pendingPlaybackTail = null;
   for (const entry of scheduledSources) {
     try { entry.source.onended = null; entry.source.stop(); } catch {}
     try { entry.source.disconnect(); } catch {}
@@ -281,10 +283,19 @@ function scheduleQueuedAudio() {
 function scheduleChunk(samples) {
   if (!audioCtx) return false;
 
+  const now = audioCtx.currentTime;
+  const minStartTime = now + PLAYBACK_SAFETY_SEC;
+  const startTime = Math.max(nextPlayTime, minStartTime);
+  if (startTime - now > MAX_BUFFER_AHEAD_SEC) {
+    return false;
+  }
+
   // Resample 16kHz → audioCtx.sampleRate for playback
   const outSR = audioCtx.sampleRate;
   const ratio = TARGET_SAMPLE_RATE / outSR;
   const outLen = Math.round(samples.length / ratio);
+  if (outLen <= 0) return true;
+
   const resampled = new Float32Array(outLen);
   for (let i = 0; i < outLen; i++) {
     const srcPos = i * ratio;
@@ -295,16 +306,14 @@ function scheduleChunk(samples) {
     resampled[i] = s0 + frac * (s1 - s0);
   }
 
-  const buffer = audioCtx.createBuffer(1, resampled.length, outSR);
-  buffer.getChannelData(0).set(resampled);
-
-  const now = audioCtx.currentTime;
-  const minStartTime = now + PLAYBACK_SAFETY_SEC;
-  const startTime = Math.max(nextPlayTime, minStartTime);
-
-  if (startTime - now > MAX_BUFFER_AHEAD_SEC) {
-    return false;
+  const crossfadeSamples = getCrossfadeSamples(outSR);
+  const blended = buildCrossfadedChunk(resampled, crossfadeSamples);
+  if (!blended || blended.length === 0) {
+    return true;
   }
+
+  const buffer = audioCtx.createBuffer(1, blended.length, outSR);
+  buffer.getChannelData(0).set(blended);
 
   const duration = buffer.duration;
   const endTime = startTime + duration;
@@ -314,18 +323,7 @@ function scheduleChunk(samples) {
   source.buffer = buffer;
   source.connect(gainNode);
   gainNode.connect(audioCtx.destination);
-
-  const fade = Math.min(PLAYBACK_FADE_SEC, duration / 2);
-  if (fade > 0) {
-    const fadeInEnd = startTime + fade;
-    const fadeOutStart = endTime - fade;
-    gainNode.gain.setValueAtTime(0, startTime);
-    gainNode.gain.linearRampToValueAtTime(1, fadeInEnd);
-    gainNode.gain.setValueAtTime(1, fadeOutStart);
-    gainNode.gain.linearRampToValueAtTime(0, endTime);
-  } else {
-    gainNode.gain.setValueAtTime(1, startTime);
-  }
+  gainNode.gain.setValueAtTime(1, startTime);
 
   const entry = { source, gainNode, endTime };
   source.onended = () => {
@@ -340,6 +338,51 @@ function scheduleChunk(samples) {
   nextPlayTime = endTime;
   scheduledSources.push(entry);
   return true;
+}
+
+function getCrossfadeSamples(outSR) {
+  return Math.max(1, Math.round((CROSSFADE_SAMPLES_16K * outSR) / TARGET_SAMPLE_RATE));
+}
+
+function buildCrossfadedChunk(chunk, crossfadeSamples) {
+  let merged = chunk;
+
+  if (pendingPlaybackTail && pendingPlaybackTail.length > 0) {
+    const prevTail = pendingPlaybackTail;
+    const overlap = Math.min(prevTail.length, chunk.length, crossfadeSamples);
+    const prevPrefixLen = prevTail.length - overlap;
+    merged = new Float32Array(prevPrefixLen + chunk.length);
+
+    if (prevPrefixLen > 0) {
+      merged.set(prevTail.subarray(0, prevPrefixLen), 0);
+    }
+
+    for (let i = 0; i < overlap; i++) {
+      // Complementary raised-cosine weights smooth the boundary while preserving gain.
+      const phase = overlap <= 1 ? 1 : i / (overlap - 1);
+      const fadeIn = 0.5 - 0.5 * Math.cos(Math.PI * phase);
+      const fadeOut = 1 - fadeIn;
+      const prevSample = prevTail[prevPrefixLen + i];
+      const nextSample = chunk[i];
+      merged[prevPrefixLen + i] = prevSample * fadeOut + nextSample * fadeIn;
+    }
+
+    if (chunk.length > overlap) {
+      merged.set(chunk.subarray(overlap), prevPrefixLen + overlap);
+    }
+  }
+
+  if (merged.length <= crossfadeSamples) {
+    pendingPlaybackTail = new Float32Array(merged);
+    return null;
+  }
+
+  const bodyLen = merged.length - crossfadeSamples;
+  const playbackChunk = new Float32Array(bodyLen);
+  playbackChunk.set(merged.subarray(0, bodyLen));
+  pendingPlaybackTail = new Float32Array(crossfadeSamples);
+  pendingPlaybackTail.set(merged.subarray(bodyLen));
+  return playbackChunk;
 }
 
 function normalizeTranscriptText(value) {
