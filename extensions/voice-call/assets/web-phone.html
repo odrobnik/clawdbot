@@ -435,7 +435,6 @@ function startSpeechRecognition() {
     speechRecog = new SpeechRecognition();
     speechRecog.continuous = true;
     speechRecog.interimResults = true;
-    speechRecog.lang = 'en-US';
 
     speechRecog.onresult = (event) => {
       if (!connected || speechRecogMuted) return;
