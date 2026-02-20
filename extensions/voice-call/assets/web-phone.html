@@ -63,25 +63,149 @@ const TOKEN = qs.get('token') || '';
 // ─────────────────────────────────────────────────────────────
 
 const TARGET_SAMPLE_RATE = 16000;
-const PLAYBACK_SAFETY_SEC = 0.05;
-const CROSSFADE_SAMPLES_16K = 80; // 5ms at 16kHz
-const MIN_START_BUFFER_SEC = 0.32;
-const TARGET_BUFFER_AHEAD_SEC = 0.8;
-const MAX_QUEUE_CHUNKS = 80;
-const MAX_BUFFER_AHEAD_SEC = 2.5;
+const PLAYBACK_RING_BUFFER_SECONDS = 5;
+const PLAYBACK_PRIME_MS = 200;
+const PCM_PLAYER_PROCESSOR_NAME = 'pcm-player-processor';
+const PCM_PLAYER_WORKLET_SOURCE = `
+class PcmPlayerProcessor extends AudioWorkletProcessor {
+  constructor(options) {
+    super();
+    const processorOptions = options && options.processorOptions ? options.processorOptions : {};
+    const ringBufferSeconds = Math.max(1, Number(processorOptions.ringBufferSeconds) || 5);
+    this.capacity = Math.max(128, Math.floor(sampleRate * ringBufferSeconds));
+    this.ringBuffer = new Float32Array(this.capacity);
+    this.readIndex = 0;
+    this.writeIndex = 0;
+    this.bufferedSamples = 0;
+    const primeMs = Math.max(0, Number(processorOptions.primeMs) || 0);
+    this.primeSamples = Math.floor((sampleRate * primeMs) / 1000);
+    this.primed = this.primeSamples === 0;
+
+    this.port.onmessage = (event) => {
+      const payload = event.data;
+      if (!payload) return;
+      if (payload === 'clear' || payload.type === 'clear') {
+        this.clear();
+        return;
+      }
+      if (payload instanceof Float32Array) {
+        this.pushSamples(payload);
+      }
+    };
+  }
+
+  clear() {
+    this.readIndex = 0;
+    this.writeIndex = 0;
+    this.bufferedSamples = 0;
+    this.primed = this.primeSamples === 0;
+  }
+
+  pushSamples(samples) {
+    const length = samples.length;
+    if (length <= 0) return;
+
+    if (length >= this.capacity) {
+      const start = length - this.capacity;
+      for (let i = 0; i < this.capacity; i++) {
+        this.ringBuffer[i] = samples[start + i];
+      }
+      this.readIndex = 0;
+      this.writeIndex = 0;
+      this.bufferedSamples = this.capacity;
+      this.primed = this.primeSamples === 0 || this.bufferedSamples >= this.primeSamples;
+      return;
+    }
+
+    const overflow = this.bufferedSamples + length - this.capacity;
+    if (overflow > 0) {
+      this.readIndex += overflow;
+      if (this.readIndex >= this.capacity) {
+        this.readIndex -= this.capacity;
+      }
+      this.bufferedSamples -= overflow;
+    }
+
+    const tailSpace = this.capacity - this.writeIndex;
+    const firstCopy = length < tailSpace ? length : tailSpace;
+    for (let i = 0; i < firstCopy; i++) {
+      this.ringBuffer[this.writeIndex + i] = samples[i];
+    }
+
+    const remaining = length - firstCopy;
+    if (remaining > 0) {
+      for (let i = 0; i < remaining; i++) {
+        this.ringBuffer[i] = samples[firstCopy + i];
+      }
+    }
+
+    this.writeIndex += length;
+    if (this.writeIndex >= this.capacity) {
+      this.writeIndex -= this.capacity;
+    }
+    this.bufferedSamples += length;
+    if (!this.primed && this.bufferedSamples >= this.primeSamples) {
+      this.primed = true;
+    }
+  }
+
+  process(_, outputs) {
+    const output = outputs[0];
+    if (!output || output.length === 0) return true;
+    const channel = output[0];
+    if (!channel) return true;
+
+    const frames = channel.length;
+    if (!this.primed) {
+      for (let i = 0; i < frames; i++) {
+        channel[i] = 0;
+      }
+      if (this.bufferedSamples >= this.primeSamples) {
+        this.primed = true;
+      }
+    } else {
+      let available = this.bufferedSamples;
+      let readIndex = this.readIndex;
+      for (let i = 0; i < frames; i++) {
+        if (available > 0) {
+          channel[i] = this.ringBuffer[readIndex];
+          readIndex++;
+          if (readIndex === this.capacity) {
+            readIndex = 0;
+          }
+          available--;
+        } else {
+          channel[i] = 0;
+        }
+      }
+      this.readIndex = readIndex;
+      this.bufferedSamples = available;
+      if (available === 0 && this.primeSamples > 0) {
+        this.primed = false;
+      }
+    }
+
+    for (let c = 1; c < output.length; c++) {
+      const outChannel = output[c];
+      for (let i = 0; i < frames; i++) {
+        outChannel[i] = channel[i];
+      }
+    }
+
+    return true;
+  }
+}
+
+registerProcessor('${PCM_PLAYER_PROCESSOR_NAME}', PcmPlayerProcessor);
+`;
 
 let ws = null;
 let audioCtx = null;
 let micStream = null;
 let scriptNode = null;
+let playbackNode = null;
 let connected = false;
-let audioQueue = [];
-let queuedDurationSec = 0;
-let scheduledSources = [];
-let nextPlayTime = 0;
-let waitingForPrebuffer = true;
 let lastFinalUserText = '';
-let pendingPlaybackTail = null;
 
 const btn = document.getElementById('callBtn');
 const transcript = document.getElementById('transcript');
@@ -100,11 +224,6 @@ async function startCall() {
   btn.disabled = true;
   statusText.textContent = 'Connecting…';
   transcript.innerHTML = '';
-  audioQueue = [];
-  queuedDurationSec = 0;
-  scheduledSources = [];
-  nextPlayTime = 0;
-  waitingForPrebuffer = true;
   lastFinalUserText = '';
 
   try {
@@ -112,6 +231,21 @@ async function startCall() {
   } catch (e) {
     statusText.textContent = 'Microphone access denied';
     statusDot.className = 'status-dot error';
+    btn.disabled = false;
+    return;
+  }
+
+  try {
+    await startMicCapture();
+  } catch (e) {
+    console.error('Audio init error:', e);
+    statusText.textContent = 'Audio init failed';
+    statusDot.className = 'status-dot error';
+    if (scriptNode) { scriptNode.disconnect(); scriptNode = null; }
+    clearAudioPlayback();
+    if (playbackNode) { playbackNode.disconnect(); playbackNode = null; }
+    if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; }
+    if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
     btn.disabled = false;
     return;
   }
@@ -126,7 +260,6 @@ async function startCall() {
     btn.textContent = '📞 Hang Up';
     btn.className = 'btn btn-hangup';
     btn.disabled = false;
-    startMicCapture();
   };
 
   ws.onmessage = (evt) => {
@@ -163,6 +296,7 @@ function cleanup() {
   connected = false;
   if (scriptNode) { scriptNode.disconnect(); scriptNode = null; }
   clearAudioPlayback();
+  if (playbackNode) { playbackNode.disconnect(); playbackNode = null; }
   if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; }
   if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
   if (ws) { ws.close(); ws = null; }
@@ -175,8 +309,9 @@ function cleanup() {
   btn.disabled = false;
 }
 
-function startMicCapture() {
+async function startMicCapture() {
   audioCtx = new AudioContext({ sampleRate: 48000 });
+  playbackNode = await createPlaybackNode(audioCtx);
   const source = audioCtx.createMediaStreamSource(micStream);
   // Use ScriptProcessorNode for broad compatibility
   const bufSize = 4096;
@@ -205,24 +340,16 @@ function startMicCapture() {
 
   source.connect(scriptNode);
   scriptNode.connect(audioCtx.destination); // required for onaudioprocess to fire
-  scheduleQueuedAudio();
 }
 
 function clearAudioPlayback() {
-  audioQueue = [];
-  queuedDurationSec = 0;
-  nextPlayTime = 0;
-  waitingForPrebuffer = true;
-  pendingPlaybackTail = null;
-  for (const entry of scheduledSources) {
-    try { entry.source.onended = null; entry.source.stop(); } catch {}
-    try { entry.source.disconnect(); } catch {}
-    try { entry.gainNode.disconnect(); } catch {}
-  }
-  scheduledSources = [];
+  if (!playbackNode) return;
+  try { playbackNode.port.postMessage({ type: 'clear' }); } catch {}
 }
 
 function queueAudio(base64) {
+  if (!audioCtx || !playbackNode) return;
+
   // Decode base64 PCM 16kHz 16-bit mono
   const raw = atob(base64);
   const bytes = new Uint8Array(raw.length);
@@ -232,157 +359,49 @@ function queueAudio(base64) {
   const float32 = new Float32Array(pcm16.length);
   for (let i = 0; i < pcm16.length; i++) float32[i] = pcm16[i] / 32768;
 
-  if (audioQueue.length >= MAX_QUEUE_CHUNKS) {
-    const drop = audioQueue.length - MAX_QUEUE_CHUNKS + 1;
-    const dropped = audioQueue.splice(0, drop);
-    for (const chunk of dropped) queuedDurationSec -= chunk.length / TARGET_SAMPLE_RATE;
-    queuedDurationSec = Math.max(0, queuedDurationSec);
-    console.warn(`[web-phone] Dropped ${drop} queued audio chunk(s) to cap backlog.`);
-  }
-
-  audioQueue.push(float32);
-  queuedDurationSec += float32.length / TARGET_SAMPLE_RATE;
-  scheduleQueuedAudio();
-}
-
-function scheduleQueuedAudio() {
-  if (!audioCtx || audioQueue.length === 0) return;
-
-  const now = audioCtx.currentTime;
-  if (!nextPlayTime || nextPlayTime < now - PLAYBACK_SAFETY_SEC) {
-    nextPlayTime = now + PLAYBACK_SAFETY_SEC;
-    waitingForPrebuffer = true;
-  }
-
-  const scheduledAheadSec = Math.max(0, nextPlayTime - now);
-  const totalBufferedSec = scheduledAheadSec + queuedDurationSec;
-  if (waitingForPrebuffer && totalBufferedSec < MIN_START_BUFFER_SEC) {
-    return;
-  }
-
-  waitingForPrebuffer = false;
-  while (audioQueue.length > 0) {
-    const bufferAheadSec = Math.max(0, nextPlayTime - audioCtx.currentTime);
-    if (bufferAheadSec >= TARGET_BUFFER_AHEAD_SEC || bufferAheadSec >= MAX_BUFFER_AHEAD_SEC) {
-      break;
-    }
-
-    const samples = audioQueue[0];
-    const scheduled = scheduleChunk(samples);
-    if (!scheduled) {
-      // Keep unscheduled audio queued and wait for buffer-ahead to drain.
-      break;
-    }
-
-    audioQueue.shift();
-    queuedDurationSec -= samples.length / TARGET_SAMPLE_RATE;
-    queuedDurationSec = Math.max(0, queuedDurationSec);
-  }
-}
-
-function scheduleChunk(samples) {
-  if (!audioCtx) return false;
-
-  const now = audioCtx.currentTime;
-  const minStartTime = now + PLAYBACK_SAFETY_SEC;
-  const startTime = Math.max(nextPlayTime, minStartTime);
-  if (startTime - now > MAX_BUFFER_AHEAD_SEC) {
-    return false;
-  }
-
   // Resample 16kHz → audioCtx.sampleRate for playback
   const outSR = audioCtx.sampleRate;
   const ratio = TARGET_SAMPLE_RATE / outSR;
-  const outLen = Math.round(samples.length / ratio);
-  if (outLen <= 0) return true;
+  const outLen = Math.round(float32.length / ratio);
+  if (outLen <= 0) return;
 
   const resampled = new Float32Array(outLen);
   for (let i = 0; i < outLen; i++) {
     const srcPos = i * ratio;
     const idx = Math.floor(srcPos);
     const frac = srcPos - idx;
-    const s0 = samples[idx] || 0;
-    const s1 = samples[Math.min(idx + 1, samples.length - 1)] || 0;
+    const s0 = float32[idx] || 0;
+    const s1 = float32[Math.min(idx + 1, float32.length - 1)] || 0;
     resampled[i] = s0 + frac * (s1 - s0);
   }
 
-  const crossfadeSamples = getCrossfadeSamples(outSR);
-  const blended = buildCrossfadedChunk(resampled, crossfadeSamples);
-  if (!blended || blended.length === 0) {
-    return true;
-  }
-
-  const buffer = audioCtx.createBuffer(1, blended.length, outSR);
-  buffer.getChannelData(0).set(blended);
-
-  const duration = buffer.duration;
-  const endTime = startTime + duration;
-
-  const source = audioCtx.createBufferSource();
-  const gainNode = audioCtx.createGain();
-  source.buffer = buffer;
-  source.connect(gainNode);
-  gainNode.connect(audioCtx.destination);
-  gainNode.gain.setValueAtTime(1, startTime);
-
-  const entry = { source, gainNode, endTime };
-  source.onended = () => {
-    source.onended = null;
-    try { source.disconnect(); } catch {}
-    try { gainNode.disconnect(); } catch {}
-    scheduledSources = scheduledSources.filter((item) => item !== entry);
-    scheduleQueuedAudio();
-  };
-
-  source.start(startTime);
-  nextPlayTime = endTime;
-  scheduledSources.push(entry);
-  return true;
+  playbackNode.port.postMessage(resampled, [resampled.buffer]);
 }
 
-function getCrossfadeSamples(outSR) {
-  return Math.max(1, Math.round((CROSSFADE_SAMPLES_16K * outSR) / TARGET_SAMPLE_RATE));
-}
-
-function buildCrossfadedChunk(chunk, crossfadeSamples) {
-  let merged = chunk;
-
-  if (pendingPlaybackTail && pendingPlaybackTail.length > 0) {
-    const prevTail = pendingPlaybackTail;
-    const overlap = Math.min(prevTail.length, chunk.length, crossfadeSamples);
-    const prevPrefixLen = prevTail.length - overlap;
-    merged = new Float32Array(prevPrefixLen + chunk.length);
-
-    if (prevPrefixLen > 0) {
-      merged.set(prevTail.subarray(0, prevPrefixLen), 0);
-    }
-
-    for (let i = 0; i < overlap; i++) {
-      // Complementary raised-cosine weights smooth the boundary while preserving gain.
-      const phase = overlap <= 1 ? 1 : i / (overlap - 1);
-      const fadeIn = 0.5 - 0.5 * Math.cos(Math.PI * phase);
-      const fadeOut = 1 - fadeIn;
-      const prevSample = prevTail[prevPrefixLen + i];
-      const nextSample = chunk[i];
-      merged[prevPrefixLen + i] = prevSample * fadeOut + nextSample * fadeIn;
-    }
-
-    if (chunk.length > overlap) {
-      merged.set(chunk.subarray(overlap), prevPrefixLen + overlap);
-    }
+async function createPlaybackNode(ctx) {
+  if (!ctx.audioWorklet) {
+    throw new Error('AudioWorklet is not supported in this browser.');
   }
 
-  if (merged.length <= crossfadeSamples) {
-    pendingPlaybackTail = new Float32Array(merged);
-    return null;
+  const blob = new Blob([PCM_PLAYER_WORKLET_SOURCE], { type: 'application/javascript' });
+  const moduleUrl = URL.createObjectURL(blob);
+  try {
+    await ctx.audioWorklet.addModule(moduleUrl);
+  } finally {
+    URL.revokeObjectURL(moduleUrl);
   }
 
-  const bodyLen = merged.length - crossfadeSamples;
-  const playbackChunk = new Float32Array(bodyLen);
-  playbackChunk.set(merged.subarray(0, bodyLen));
-  pendingPlaybackTail = new Float32Array(crossfadeSamples);
-  pendingPlaybackTail.set(merged.subarray(bodyLen));
-  return playbackChunk;
+  const node = new AudioWorkletNode(ctx, PCM_PLAYER_PROCESSOR_NAME, {
+    numberOfInputs: 0,
+    numberOfOutputs: 1,
+    outputChannelCount: [1],
+    processorOptions: {
+      ringBufferSeconds: PLAYBACK_RING_BUFFER_SECONDS,
+      primeMs: PLAYBACK_PRIME_MS
+    }
+  });
+  node.connect(ctx.destination);
+  return node;
 }
 
 function normalizeTranscriptText(value) {
