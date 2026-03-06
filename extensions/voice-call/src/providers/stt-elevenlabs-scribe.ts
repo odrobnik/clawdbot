@@ -164,30 +164,33 @@ class ElevenLabsScribeTranscriptionSession implements RealtimeTranscriptionSessi
         params.set("language_code", this.config.languageCode);
       }
 
-      this.ws = new WebSocket(
-        `wss://api.elevenlabs.io/v1/speech-to-text/realtime?${params.toString()}`,
-        {
-          headers: {
-            "xi-api-key": this.config.apiKey,
-          },
+      const url = `wss://api.elevenlabs.io/v1/speech-to-text/realtime?${params.toString()}`;
+      const ws = new WebSocket(url, {
+        headers: {
+          "xi-api-key": this.config.apiKey,
         },
-      );
+      });
+      this.ws = ws;
 
       const connectTimeout = setTimeout(() => {
-        if (!this.connected) {
-          this.ws?.close();
+        if (ws.readyState !== WebSocket.OPEN) {
+          try {
+            ws.close();
+          } catch {
+            // ignore close errors during timeout cleanup
+          }
           reject(new Error("ElevenLabs Scribe STT connection timeout"));
         }
       }, ElevenLabsScribeTranscriptionSession.CONNECT_TIMEOUT_MS);
 
-      this.ws.on("open", () => {
+      ws.on("open", () => {
         clearTimeout(connectTimeout);
         this.connected = true;
         this.reconnectAttempts = 0;
         resolve();
       });
 
-      this.ws.on("message", (data: Buffer) => {
+      ws.on("message", (data: Buffer) => {
         try {
           this.handleEvent(JSON.parse(data.toString()) as ScribeEvent);
         } catch (error) {
@@ -195,7 +198,7 @@ class ElevenLabsScribeTranscriptionSession implements RealtimeTranscriptionSessi
         }
       });
 
-      this.ws.on("error", (error) => {
+      ws.on("error", (error) => {
         if (!this.connected) {
           clearTimeout(connectTimeout);
           reject(error);
@@ -204,7 +207,7 @@ class ElevenLabsScribeTranscriptionSession implements RealtimeTranscriptionSessi
         this.config.onError?.(error instanceof Error ? error : new Error(String(error)));
       });
 
-      this.ws.on("close", () => {
+      ws.on("close", () => {
         clearTimeout(connectTimeout);
         this.connected = false;
         if (this.closed) {
