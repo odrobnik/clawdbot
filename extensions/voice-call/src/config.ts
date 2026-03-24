@@ -64,21 +64,6 @@ export const PlivoConfigSchema = z
   .strict();
 export type PlivoConfig = z.infer<typeof PlivoConfigSchema>;
 
-// -----------------------------------------------------------------------------
-// STT/TTS Configuration
-// -----------------------------------------------------------------------------
-
-export const SttConfigSchema = z
-  .object({
-    /** STT provider (currently only OpenAI supported) */
-    provider: z.literal("openai").default("openai"),
-    /** Whisper model to use */
-    model: z.string().min(1).default("whisper-1"),
-  })
-  .strict()
-  .default({ provider: "openai", model: "whisper-1" });
-export type SttConfig = z.infer<typeof SttConfigSchema>;
-
 export { TtsAutoSchema, TtsConfigSchema, TtsModeSchema, TtsProviderSchema };
 export type VoiceCallTtsConfig = z.infer<typeof TtsConfigSchema>;
 
@@ -370,9 +355,6 @@ export const VoiceCallConfigSchema = z
     /** Skip webhook signature verification (development only, NOT for production) */
     skipSignatureVerification: z.boolean().default(false),
 
-    /** STT configuration */
-    stt: SttConfigSchema,
-
     /** TTS config for voice calls (does NOT read or merge core messages.tts) */
     tts: TtsConfigSchema,
 
@@ -390,19 +372,6 @@ export const VoiceCallConfigSchema = z
 
     /** Timeout for response generation in ms (default 30s) */
     responseTimeoutMs: z.number().int().positive().default(30000),
-
-    /** Silence filler — plays ambient SFX while agent is working */
-    silenceFiller: z
-      .object({
-        /** Enable/disable silence filler (default: true when streaming enabled) */
-        enabled: z.boolean().optional(),
-        /** Milliseconds of silence before filler starts (default: 3500) */
-        thresholdMs: z.number().int().positive().optional(),
-        /** SFX set: "typing" (keyboard sounds) or "processing" (digital hum) */
-        sfxSet: z.enum(["typing", "processing"]).optional(),
-      })
-      .strict()
-      .optional(),
   })
   .strict();
 

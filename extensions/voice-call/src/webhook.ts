@@ -21,7 +21,6 @@ import { resolveConfiguredCapabilityProvider } from "./provider-runtime-resoluti
 import type { VoiceCallProvider } from "./providers/base.js";
 import { isProviderStatusTerminal } from "./providers/shared/call-status.js";
 import type { TwilioProvider } from "./providers/twilio.js";
-import { SilenceFiller } from "./silence-filler.js";
 import type { CallRecord, NormalizedEvent, WebhookContext } from "./types.js";
 import type { WebhookResponsePayload } from "./webhook.types.js";
 import type { RealtimeCallHandler } from "./webhook/realtime-handler.js";
@@ -92,12 +91,6 @@ export class VoiceCallWebhookServer {
   private pendingDisconnectHangups = new Map<string, ReturnType<typeof setTimeout>>();
   /** Realtime voice handler for duplex provider bridges. */
   private realtimeHandler: RealtimeCallHandler | null = null;
-
-  /** Silence filler — plays ambient SFX while agent is working */
-  private silenceFiller: SilenceFiller | null = null;
-
-  /** Maps callSid → streamSid for silence filler routing */
-  private callStreamSids = new Map<string, string>();
 
   constructor(
     config: VoiceCallConfig,
@@ -268,28 +261,18 @@ export class VoiceCallWebhookServer {
         }
       },
       onSpeechStart: (providerCallId) => {
-        // Only stop silence filler on VAD speech start (not TTS — too noise-sensitive)
-        const streamSid = this.callStreamSids.get(providerCallId);
-        if (streamSid) {
-          this.silenceFiller?.stop(streamSid);
+        if (this.provider.name !== "twilio") {
+          return;
         }
+        const call = this.manager.getCallByProviderCallId(providerCallId);
+        if (this.shouldSuppressBargeInForInitialMessage(call)) {
+          return;
+        }
+        (this.provider as TwilioProvider).clearTtsQueue(providerCallId);
       },
       onPartialTranscript: (callId, partial) => {
         const safePartial = sanitizeTranscriptForLog(partial);
         console.log(`[voice-call] Partial for ${callId}: ${safePartial} (chars=${partial.length})`);
-        // Barge-in: clear TTS when actual speech is recognized (not just VAD noise)
-        if (this.provider.name === "twilio") {
-          const call = this.manager.getCallByProviderCallId(callId);
-          if (this.shouldSuppressBargeInForInitialMessage(call)) {
-            return;
-          }
-          (this.provider as TwilioProvider).clearTtsQueue(callId);
-        }
-        // Also stop silence filler on partial transcript
-        const streamSid = this.callStreamSids.get(callId);
-        if (streamSid) {
-          this.silenceFiller?.stop(streamSid);
-        }
       },
       onConnect: (callId, streamSid) => {
         console.log(`[voice-call] Media stream connected: ${callId} -> ${streamSid}`);
@@ -299,8 +282,6 @@ export class VoiceCallWebhookServer {
         if (this.provider.name === "twilio") {
           (this.provider as TwilioProvider).registerCallStream(callId, streamSid);
         }
-        // Track for silence filler
-        this.callStreamSids.set(callId, streamSid);
 
         // Speak initial message immediately (no delay) to avoid stream timeout
         this.manager.speakInitialMessage(callId).catch((err) => {
@@ -337,21 +318,10 @@ export class VoiceCallWebhookServer {
         }, STREAM_DISCONNECT_HANGUP_GRACE_MS);
         timer.unref?.();
         this.pendingDisconnectHangups.set(callId, timer);
-
-        // Clean up silence filler state for the disconnected stream.
-        this.silenceFiller?.stop(streamSid);
-        if (this.callStreamSids.get(callId) === streamSid) {
-          this.callStreamSids.delete(callId);
-        }
       },
     };
 
     this.mediaStreamHandler = new MediaStreamHandler(streamConfig);
-    this.silenceFiller = new SilenceFiller(this.mediaStreamHandler, {
-      thresholdMs: this.config.silenceFiller?.thresholdMs,
-      sfxSet: this.config.silenceFiller?.sfxSet,
-      enabled: this.config.silenceFiller?.enabled,
-    });
     console.log("[voice-call] Media streaming initialized");
   }
 
@@ -717,14 +687,6 @@ export class VoiceCallWebhookServer {
       return;
     }
 
-    // Start silence filler while waiting for the LLM / tool calls
-    const streamSid = call.providerCallId
-      ? this.callStreamSids.get(call.providerCallId)
-      : undefined;
-    if (streamSid) {
-      this.silenceFiller?.start(streamSid);
-    }
-
     try {
       const { generateVoiceResponse } = await import("./response-generator.js");
 
@@ -738,11 +700,6 @@ export class VoiceCallWebhookServer {
         userMessage,
       });
 
-      // Stop filler before speaking the response
-      if (streamSid) {
-        this.silenceFiller?.stop(streamSid);
-      }
-
       if (result.error) {
         console.error(`[voice-call] Response generation error: ${result.error}`);
         return;
@@ -752,25 +709,7 @@ export class VoiceCallWebhookServer {
         console.log(`[voice-call] AI response: "${result.text}"`);
         await this.manager.speak(callId, result.text);
       }
-
-      if (result.endCall) {
-        // Agent requested hangup — give TTS a moment to finish, then hang up.
-        // If fallback <Say> is used, speak() resolves immediately, so we pad the timeout
-        // based on text length to avoid truncating the goodbye message.
-        const delayMs = result.text ? Math.max(1000, result.text.length * 80) : 1000;
-        console.log(`[voice-call] Agent requested end_call for ${callId} (delay: ${delayMs}ms)`);
-        setTimeout(() => {
-          this.manager.endCall(callId).catch((err: unknown) => {
-            console.warn(`[voice-call] Hangup failed:`, err);
-          });
-        }, delayMs);
-        return;
-      }
     } catch (err) {
-      // Stop filler on error too
-      if (streamSid) {
-        this.silenceFiller?.stop(streamSid);
-      }
       console.error(`[voice-call] Auto-response error:`, err);
     }
   }

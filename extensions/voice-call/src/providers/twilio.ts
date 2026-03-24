@@ -402,10 +402,8 @@ export class TwilioProvider implements VoiceCallProvider {
       case "pause":
         return TwilioProvider.PAUSE_TWIML;
       case "stream": {
-        const streamData = view.callSid ? this.getStreamUrlForCall(view.callSid) : null;
-        return streamData
-          ? this.getStreamConnectXml(streamData.url, streamData.token)
-          : TwilioProvider.PAUSE_TWIML;
+        const streamUrl = view.callSid ? this.getStreamUrlForCall(view.callSid) : null;
+        return streamUrl ? this.getStreamConnectXml(streamUrl) : TwilioProvider.PAUSE_TWIML;
       }
       case "empty":
       default:
@@ -447,16 +445,15 @@ export class TwilioProvider implements VoiceCallProvider {
     return token;
   }
 
-  private getStreamUrlForCall(callSid: string): { url: string; token: string } | null {
+  private getStreamUrlForCall(callSid: string): string | null {
     const baseUrl = this.getStreamUrl();
     if (!baseUrl) {
       return null;
     }
     const token = this.getStreamAuthToken(callSid);
-    // Twilio <Stream> does NOT forward query string parameters on the WebSocket URL.
-    // The token is passed as a <Parameter> element inside the TwiML instead,
-    // and arrives in the WebSocket start message's customParameters.
-    return { url: baseUrl, token };
+    const url = new URL(baseUrl);
+    url.searchParams.set("token", token);
+    return url.toString();
   }
 
   /**
@@ -465,21 +462,22 @@ export class TwilioProvider implements VoiceCallProvider {
    *
    * @param streamUrl - WebSocket URL (wss://...) for the media stream
    */
-  getStreamConnectXml(streamUrl: string, token?: string): string {
-    if (token) {
-      return `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Connect>
-    <Stream url="${escapeXml(streamUrl)}">
-      <Parameter name="token" value="${escapeXml(token)}" />
-    </Stream>
-  </Connect>
-</Response>`;
-    }
+  getStreamConnectXml(streamUrl: string): string {
+    // Extract token from URL and pass via <Parameter> instead of query string.
+    // Twilio strips query params from WebSocket URLs, but delivers <Parameter>
+    // values in the "start" message's customParameters field.
+    const parsed = new URL(streamUrl);
+    const token = parsed.searchParams.get("token");
+    parsed.searchParams.delete("token");
+    const cleanUrl = parsed.toString();
+
+    const paramXml = token ? `\n      <Parameter name="token" value="${escapeXml(token)}" />` : "";
+
     return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="${escapeXml(streamUrl)}" />
+    <Stream url="${escapeXml(cleanUrl)}">${paramXml}
+    </Stream>
   </Connect>
 </Response>`;
   }
@@ -598,8 +596,7 @@ export class TwilioProvider implements VoiceCallProvider {
 
   /**
    * Play TTS via core TTS and Twilio Media Streams.
-   * Prefers streaming TTS (sends audio chunks as they arrive from the provider)
-   * for lower latency. Falls back to buffered synthesis when streaming is unavailable.
+   * Generates audio with core TTS, converts to mu-law, and streams via WebSocket.
    * Uses a queue to serialize playback and prevent overlapping audio.
    */
   private async playTtsViaStream(text: string, streamSid: string): Promise<void> {
@@ -607,9 +604,10 @@ export class TwilioProvider implements VoiceCallProvider {
       throw new Error("TTS provider and media stream handler required");
     }
 
-    // Use larger chunks (80ms = 640 bytes) to reduce per-chunk overhead
-    const CHUNK_SIZE = 640;
-    const CHUNK_DELAY_MS = 80;
+    // Stream audio in 20ms chunks (160 bytes at 8kHz mu-law)
+    const CHUNK_SIZE = 160;
+    const CHUNK_DELAY_MS = 20;
+    const SILENCE_CHUNK = Buffer.alloc(CHUNK_SIZE, 0xff);
 
     const handler = this.mediaStreamHandler;
     const ttsProvider = this.ttsProvider;
@@ -643,183 +641,77 @@ export class TwilioProvider implements VoiceCallProvider {
     };
 
     await handler.queueTts(streamSid, async (signal) => {
-      let totalBytesSent = 0;
+      const sendKeepAlive = () => {
+        sendAudioChunk(SILENCE_CHUNK);
+      };
+      sendKeepAlive();
+      const keepAlive = setInterval(() => {
+        if (!signal.aborted) {
+          sendKeepAlive();
+        }
+      }, CHUNK_DELAY_MS);
+
+      // Generate audio with core TTS (returns mu-law at 8kHz)
+      let muLawAudio: Buffer;
+      let synthTimeout: ReturnType<typeof setTimeout> | null = null;
+      try {
+        const synthPromise = ttsProvider.synthesizeForTelephony(text);
+        const timeoutPromise = new Promise<Buffer>((_, reject) => {
+          synthTimeout = setTimeout(() => {
+            reject(
+              new Error(
+                `Telephony TTS synthesis timed out after ${TwilioProvider.TTS_SYNTH_TIMEOUT_MS}ms`,
+              ),
+            );
+          }, TwilioProvider.TTS_SYNTH_TIMEOUT_MS);
+        });
+        muLawAudio = await Promise.race([synthPromise, timeoutPromise]);
+      } finally {
+        if (synthTimeout) {
+          clearTimeout(synthTimeout);
+        }
+        clearInterval(keepAlive);
+      }
+
       let chunkAttempts = 0;
       let chunkDelivered = 0;
-
-      // Prefer streaming TTS for lower latency
-      if (ttsProvider.streamForTelephony) {
-        console.log(`[voice-call] Using streaming TTS for stream ${streamSid}`);
-        let remainder: Buffer = Buffer.alloc(0);
-        let audioSent = false;
-        let abortListenerAttached = false;
-        let streamTimedOut = false;
-        const streamAbort = new AbortController();
-        const onAbort = () => {
-          console.log(`[voice-call] Streaming TTS aborted for stream ${streamSid}`);
-          streamAbort.abort();
-        };
+      let nextChunkDueAt = Date.now() + CHUNK_DELAY_MS;
+      for (const chunk of chunkAudio(muLawAudio, CHUNK_SIZE)) {
         if (signal.aborted) {
-          onAbort();
-        } else {
-          signal.addEventListener("abort", onAbort, { once: true });
-          abortListenerAttached = true;
+          break;
+        }
+        chunkAttempts += 1;
+        const chunkResult = sendAudioChunk(chunk);
+        if (chunkResult.sent) {
+          chunkDelivered += 1;
         }
 
-        try {
-          const iterator = ttsProvider
-            .streamForTelephony(text, streamAbort.signal)
-            [Symbol.asyncIterator]();
-          while (true) {
-            let readTimeout: ReturnType<typeof setTimeout> | null = null;
-            try {
-              const nextPromise = iterator.next();
-              const timeoutPromise = new Promise<IteratorResult<Buffer>>((_, reject) => {
-                readTimeout = setTimeout(() => {
-                  streamTimedOut = true;
-                  streamAbort.abort();
-                  reject(
-                    new Error(
-                      `Telephony TTS streaming timed out after ${TwilioProvider.TTS_SYNTH_TIMEOUT_MS}ms`,
-                    ),
-                  );
-                }, TwilioProvider.TTS_SYNTH_TIMEOUT_MS);
-              });
-              const { done, value } = await Promise.race([nextPromise, timeoutPromise]);
-              if (done) {
-                break;
-              }
-              const chunk = value;
-              if (chunk.length > 0) {
-                console.log(`[voice-call] Streaming TTS chunk received: ${chunk.length} bytes`);
-              }
-              if (signal.aborted) {
-                break;
-              }
-
-              // Accumulate audio and send in paced chunks
-              remainder = remainder.length > 0 ? Buffer.concat([remainder, chunk]) : chunk;
-
-              while (remainder.length >= CHUNK_SIZE) {
-                if (signal.aborted) {
-                  break;
-                }
-                const chunkResult = sendAudioChunk(remainder.subarray(0, CHUNK_SIZE));
-                chunkAttempts += 1;
-                if (chunkResult.sent) {
-                  chunkDelivered += 1;
-                }
-                totalBytesSent += CHUNK_SIZE;
-                audioSent = true;
-                remainder = remainder.subarray(CHUNK_SIZE);
-                await new Promise((resolve) => setTimeout(resolve, CHUNK_DELAY_MS));
-              }
-            } finally {
-              if (readTimeout) {
-                clearTimeout(readTimeout);
-              }
-            }
-          }
-        } catch (err) {
-          if (audioSent) {
-            // Partial audio already sent — do not fall back to <Say> which would
-            // replay the entire text, causing a jarring double-response.
-            console.warn(
-              `[voice-call] Streaming TTS failed after partial audio sent; suppressing fallback:`,
-              err instanceof Error ? err.message : err,
-            );
-            console.log(
-              `[voice-call] TTS bytes sent to Twilio for stream ${streamSid}: ${totalBytesSent}`,
-            );
-            return;
-          }
-          if (streamTimedOut) {
-            throw new Error(
-              `Telephony TTS streaming timed out after ${TwilioProvider.TTS_SYNTH_TIMEOUT_MS}ms`,
-            );
-          }
-          throw err;
-        } finally {
-          if (abortListenerAttached) {
-            signal.removeEventListener("abort", onAbort);
-          }
+        // Drift-corrected pacing: schedule against an absolute clock to avoid cumulative delay.
+        const waitMs = nextChunkDueAt - Date.now();
+        if (waitMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, Math.ceil(waitMs)));
         }
-
-        // Send any remaining audio
-        if (!signal.aborted && remainder.length > 0) {
-          const chunkResult = sendAudioChunk(remainder);
-          chunkAttempts += 1;
-          if (chunkResult.sent) {
-            chunkDelivered += 1;
-          }
-          totalBytesSent += remainder.length;
-        }
-      } else {
-        console.log(`[voice-call] Using buffered TTS for stream ${streamSid}`);
-        const silenceChunk = Buffer.alloc(160, 0xff);
-        const sendKeepAlive = () => {
-          sendAudioChunk(silenceChunk);
-        };
-        sendKeepAlive();
-        const keepAlive = setInterval(() => {
-          if (!signal.aborted) {
-            sendKeepAlive();
-          }
-        }, 20);
-
-        let muLawAudio: Buffer;
-        let synthTimeout: ReturnType<typeof setTimeout> | null = null;
-        try {
-          const synthPromise = ttsProvider.synthesizeForTelephony(text);
-          const timeoutPromise = new Promise<Buffer>((_, reject) => {
-            synthTimeout = setTimeout(() => {
-              reject(
-                new Error(
-                  `Telephony TTS synthesis timed out after ${TwilioProvider.TTS_SYNTH_TIMEOUT_MS}ms`,
-                ),
-              );
-            }, TwilioProvider.TTS_SYNTH_TIMEOUT_MS);
-          });
-          muLawAudio = await Promise.race([synthPromise, timeoutPromise]);
-        } finally {
-          if (synthTimeout) {
-            clearTimeout(synthTimeout);
-          }
-          clearInterval(keepAlive);
-        }
-
-        for (const chunk of chunkAudio(muLawAudio, CHUNK_SIZE)) {
-          if (signal.aborted) {
-            break;
-          }
-          const chunkResult = sendAudioChunk(chunk);
-          chunkAttempts += 1;
-          if (chunkResult.sent) {
-            chunkDelivered += 1;
-          }
-          totalBytesSent += chunk.length;
-          await new Promise((resolve) => setTimeout(resolve, CHUNK_DELAY_MS));
-          if (signal.aborted) {
-            break;
-          }
+        nextChunkDueAt += CHUNK_DELAY_MS;
+        if (signal.aborted) {
+          break;
         }
       }
 
+      let markSent = true;
       if (!signal.aborted) {
-        console.log(
-          `[voice-call] TTS bytes sent to Twilio for stream ${streamSid}: ${totalBytesSent}`,
-        );
-        const markSent = sendPlaybackMark(`tts-${Date.now()}`).sent;
-        if (chunkAttempts > 0 && (chunkDelivered === 0 || !markSent)) {
-          const failures: string[] = [];
-          if (chunkDelivered === 0) {
-            failures.push("no audio chunks delivered");
-          }
-          if (!markSent) {
-            failures.push("completion mark not delivered");
-          }
-          throw new Error(`Telephony stream playback failed: ${failures.join("; ")}`);
+        // Send a mark to track when audio finishes
+        markSent = sendPlaybackMark(`tts-${Date.now()}`).sent;
+      }
+
+      if (!signal.aborted && chunkAttempts > 0 && (chunkDelivered === 0 || !markSent)) {
+        const failures: string[] = [];
+        if (chunkDelivered === 0) {
+          failures.push("no audio chunks delivered");
         }
+        if (!markSent) {
+          failures.push("completion mark not delivered");
+        }
+        throw new Error(`Telephony stream playback failed: ${failures.join("; ")}`);
       }
     });
   }
