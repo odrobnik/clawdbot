@@ -150,7 +150,6 @@ async function* streamOpenAITelephony(
 
   const model = openai?.model || "gpt-4o-mini-tts";
   const voice = openai?.voice || "coral";
-  const baseUrl = openai?.baseUrl?.replace(/\/+$/, "") || "https://api.openai.com";
 
   const body: Record<string, unknown> = {
     model,
@@ -158,14 +157,8 @@ async function* streamOpenAITelephony(
     voice,
     response_format: "pcm", // Raw PCM: 24kHz, 16-bit signed LE, mono
   };
-  if (openai?.speed !== undefined) {
-    body.speed = openai.speed;
-  }
-  if (openai?.instructions) {
-    body.instructions = openai.instructions;
-  }
 
-  const response = await fetch(`${baseUrl}/v1/audio/speech`, {
+  const response = await fetch("https://api.openai.com/v1/audio/speech", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${apiKey}`,
@@ -290,7 +283,8 @@ export function createTelephonyTtsProvider(params: {
     elevenlabsCfg?.voiceId;
 
   const canStreamOpenAI =
-    ttsConfig?.provider === "openai" && ((openaiCfg?.apiKey && typeof openaiCfg.apiKey === "string") || process.env.OPENAI_API_KEY);
+    ttsConfig?.provider === "openai" &&
+    (typeof openaiCfg?.apiKey === "string" || typeof process.env.OPENAI_API_KEY === "string");
 
   return {
     synthesizeForTelephony: async (text: string) => {
