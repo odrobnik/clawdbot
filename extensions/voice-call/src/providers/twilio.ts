@@ -715,9 +715,9 @@ export class TwilioProvider implements VoiceCallProvider {
                 chunkAttempts += 1;
                 if (chunkResult.sent) {
                   chunkDelivered += 1;
+                  audioSent = true;
                 }
                 totalBytesSent += CHUNK_SIZE;
-                audioSent = true;
                 remainder = remainder.subarray(CHUNK_SIZE);
                 await sleepUntil(nextChunkDueAt);
                 nextChunkDueAt += CHUNK_DELAY_MS;
