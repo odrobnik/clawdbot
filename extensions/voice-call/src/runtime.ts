@@ -10,13 +10,6 @@ import type { CoreAgentDeps, CoreConfig } from "./core-bridge.js";
 import { CallManager } from "./manager.js";
 import { resolveConfiguredCapabilityProvider } from "./provider-runtime-resolution.js";
 import type { VoiceCallProvider } from "./providers/base.js";
-<<<<<<< HEAD
-import type { TwilioProvider } from "./providers/twilio.js";
-import {
-  normalizeResolvedVoiceCallSecretString,
-  resolveVoiceCallRuntimeSecrets,
-} from "./secret-input.js";
-=======
 import { MockProvider } from "./providers/mock.js";
 import { PlivoProvider } from "./providers/plivo.js";
 import { TelnyxProvider } from "./providers/telnyx.js";
@@ -25,7 +18,6 @@ import {
   normalizeResolvedVoiceCallSecretString,
   resolveVoiceCallRuntimeSecrets,
 } from "./secret-input.js";
->>>>>>> e13d21579a (fix(voice-call): resolve SecretRef-backed credentials)
 import type { TelephonyTtsRuntime } from "./telephony-tts.js";
 import { createTelephonyTtsProvider } from "./telephony-tts.js";
 import { startTunnel, type TunnelResult } from "./tunnel.js";

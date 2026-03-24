@@ -1,7 +1,11 @@
 import crypto from "node:crypto";
 import { safeEqualSecret } from "openclaw/plugin-sdk/browser-security-runtime";
 import { normalizeOptionalString } from "openclaw/plugin-sdk/text-runtime";
-import type { TwilioConfig } from "../config.js";
+
+type TwilioProviderConfig = {
+  accountSid?: string;
+  authToken?: string;
+};
 import { getHeader } from "../http-headers.js";
 import type { MediaStreamHandler } from "../media-stream.js";
 import { chunkAudio } from "../telephony-audio.js";
@@ -121,7 +125,7 @@ export class TwilioProvider implements VoiceCallProvider {
     this.streamAuthTokens.delete(providerCallId);
   }
 
-  constructor(config: TwilioConfig, options: TwilioProviderOptions = {}) {
+  constructor(config: TwilioProviderConfig, options: TwilioProviderOptions = {}) {
     if (!config.accountSid) {
       throw new Error("Twilio Account SID is required");
     }
@@ -641,65 +645,176 @@ export class TwilioProvider implements VoiceCallProvider {
     };
 
     await handler.queueTts(streamSid, async (signal) => {
-      const sendKeepAlive = () => {
-        sendAudioChunk(SILENCE_CHUNK);
-      };
-      sendKeepAlive();
-      const keepAlive = setInterval(() => {
-        if (!signal.aborted) {
-          sendKeepAlive();
-        }
-      }, CHUNK_DELAY_MS);
-
-      // Generate audio with core TTS (returns mu-law at 8kHz)
-      let muLawAudio: Buffer;
-      let synthTimeout: ReturnType<typeof setTimeout> | null = null;
-      try {
-        const synthPromise = ttsProvider.synthesizeForTelephony(text);
-        const timeoutPromise = new Promise<Buffer>((_, reject) => {
-          synthTimeout = setTimeout(() => {
-            reject(
-              new Error(
-                `Telephony TTS synthesis timed out after ${TwilioProvider.TTS_SYNTH_TIMEOUT_MS}ms`,
-              ),
-            );
-          }, TwilioProvider.TTS_SYNTH_TIMEOUT_MS);
-        });
-        muLawAudio = await Promise.race([synthPromise, timeoutPromise]);
-      } finally {
-        if (synthTimeout) {
-          clearTimeout(synthTimeout);
-        }
-        clearInterval(keepAlive);
-      }
-
+      let totalBytesSent = 0;
       let chunkAttempts = 0;
       let chunkDelivered = 0;
-      let nextChunkDueAt = Date.now() + CHUNK_DELAY_MS;
-      for (const chunk of chunkAudio(muLawAudio, CHUNK_SIZE)) {
-        if (signal.aborted) {
-          break;
-        }
-        chunkAttempts += 1;
-        const chunkResult = sendAudioChunk(chunk);
-        if (chunkResult.sent) {
-          chunkDelivered += 1;
-        }
 
-        // Drift-corrected pacing: schedule against an absolute clock to avoid cumulative delay.
-        const waitMs = nextChunkDueAt - Date.now();
+      const sleepUntil = async (targetTimeMs: number) => {
+        const waitMs = targetTimeMs - Date.now();
         if (waitMs > 0) {
           await new Promise((resolve) => setTimeout(resolve, Math.ceil(waitMs)));
         }
-        nextChunkDueAt += CHUNK_DELAY_MS;
+      };
+
+      if (ttsProvider.streamForTelephony) {
+        console.log(`[voice-call] Using streaming TTS for stream ${streamSid}`);
+        let remainder = Buffer.alloc(0);
+        let audioSent = false;
+        let abortListenerAttached = false;
+        let streamTimedOut = false;
+        let nextChunkDueAt = Date.now() + CHUNK_DELAY_MS;
+        const streamAbort = new AbortController();
+        const onAbort = () => {
+          console.log(`[voice-call] Streaming TTS aborted for stream ${streamSid}`);
+          streamAbort.abort();
+        };
         if (signal.aborted) {
-          break;
+          onAbort();
+        } else {
+          signal.addEventListener("abort", onAbort, { once: true });
+          abortListenerAttached = true;
+        }
+
+        try {
+          const iterator = ttsProvider
+            .streamForTelephony(text, streamAbort.signal)
+            [Symbol.asyncIterator]();
+          while (true) {
+            let readTimeout: ReturnType<typeof setTimeout> | null = null;
+            try {
+              const nextPromise = iterator.next();
+              const timeoutPromise = new Promise<IteratorResult<Buffer>>((_, reject) => {
+                readTimeout = setTimeout(() => {
+                  streamTimedOut = true;
+                  streamAbort.abort();
+                  reject(
+                    new Error(
+                      `Telephony TTS streaming timed out after ${TwilioProvider.TTS_SYNTH_TIMEOUT_MS}ms`,
+                    ),
+                  );
+                }, TwilioProvider.TTS_SYNTH_TIMEOUT_MS);
+              });
+              const { done, value } = await Promise.race([nextPromise, timeoutPromise]);
+              if (done) {
+                break;
+              }
+              const chunk = value;
+              if (chunk.length > 0) {
+                console.log(`[voice-call] Streaming TTS chunk received: ${chunk.length} bytes`);
+              }
+              if (signal.aborted) {
+                break;
+              }
+
+              remainder = remainder.length > 0 ? Buffer.concat([remainder, chunk]) : chunk;
+              while (remainder.length >= CHUNK_SIZE) {
+                if (signal.aborted) {
+                  break;
+                }
+                const chunkResult = sendAudioChunk(remainder.subarray(0, CHUNK_SIZE));
+                chunkAttempts += 1;
+                if (chunkResult.sent) {
+                  chunkDelivered += 1;
+                }
+                totalBytesSent += CHUNK_SIZE;
+                audioSent = true;
+                remainder = remainder.subarray(CHUNK_SIZE);
+                await sleepUntil(nextChunkDueAt);
+                nextChunkDueAt += CHUNK_DELAY_MS;
+              }
+            } finally {
+              if (readTimeout) {
+                clearTimeout(readTimeout);
+              }
+            }
+          }
+
+          if (!signal.aborted && remainder.length > 0) {
+            const chunkResult = sendAudioChunk(remainder);
+            chunkAttempts += 1;
+            if (chunkResult.sent) {
+              chunkDelivered += 1;
+            }
+            totalBytesSent += remainder.length;
+          }
+        } catch (err) {
+          if (audioSent) {
+            console.warn(
+              `[voice-call] Streaming TTS failed after partial audio sent; suppressing fallback:`,
+              err instanceof Error ? err.message : err,
+            );
+            console.log(
+              `[voice-call] TTS bytes sent to Twilio for stream ${streamSid}: ${totalBytesSent}`,
+            );
+            return;
+          }
+          if (streamTimedOut) {
+            throw new Error(
+              `Telephony TTS streaming timed out after ${TwilioProvider.TTS_SYNTH_TIMEOUT_MS}ms`,
+            );
+          }
+          console.warn(
+            `[voice-call] Streaming TTS failed before audio was sent; falling back to buffered synthesis:`,
+            err instanceof Error ? err.message : err,
+          );
+        } finally {
+          if (abortListenerAttached) {
+            signal.removeEventListener("abort", onAbort);
+          }
+        }
+      }
+
+      if (chunkAttempts === 0) {
+        console.log(`[voice-call] Using buffered TTS for stream ${streamSid}`);
+        const sendKeepAlive = () => {
+          sendAudioChunk(SILENCE_CHUNK);
+        };
+        sendKeepAlive();
+        const keepAlive = setInterval(() => {
+          if (!signal.aborted) {
+            sendKeepAlive();
+          }
+        }, CHUNK_DELAY_MS);
+
+        let muLawAudio: Buffer;
+        let synthTimeout: ReturnType<typeof setTimeout> | null = null;
+        try {
+          const synthPromise = ttsProvider.synthesizeForTelephony(text);
+          const timeoutPromise = new Promise<Buffer>((_, reject) => {
+            synthTimeout = setTimeout(() => {
+              reject(
+                new Error(
+                  `Telephony TTS synthesis timed out after ${TwilioProvider.TTS_SYNTH_TIMEOUT_MS}ms`,
+                ),
+              );
+            }, TwilioProvider.TTS_SYNTH_TIMEOUT_MS);
+          });
+          muLawAudio = await Promise.race([synthPromise, timeoutPromise]);
+        } finally {
+          if (synthTimeout) {
+            clearTimeout(synthTimeout);
+          }
+          clearInterval(keepAlive);
+        }
+
+        let nextChunkDueAt = Date.now() + CHUNK_DELAY_MS;
+        for (const chunk of chunkAudio(muLawAudio, CHUNK_SIZE)) {
+          if (signal.aborted) {
+            break;
+          }
+          chunkAttempts += 1;
+          const chunkResult = sendAudioChunk(chunk);
+          if (chunkResult.sent) {
+            chunkDelivered += 1;
+          }
+          totalBytesSent += chunk.length;
+          await sleepUntil(nextChunkDueAt);
+          nextChunkDueAt += CHUNK_DELAY_MS;
         }
       }
 
       let markSent = true;
       if (!signal.aborted) {
-        // Send a mark to track when audio finishes
         markSent = sendPlaybackMark(`tts-${Date.now()}`).sent;
       }
 
@@ -714,8 +829,6 @@ export class TwilioProvider implements VoiceCallProvider {
         throw new Error(`Telephony stream playback failed: ${failures.join("; ")}`);
       }
     });
-  }
-
   /**
    * Start listening for speech via Twilio <Gather>.
    */

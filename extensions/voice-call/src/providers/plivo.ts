@@ -3,7 +3,12 @@ import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
 } from "openclaw/plugin-sdk/text-runtime";
-import type { PlivoConfig, WebhookSecurityConfig } from "../config.js";
+import type { WebhookSecurityConfig } from "../config.js";
+
+type PlivoProviderConfig = {
+  authId?: string;
+  authToken?: string;
+};
 import { getHeader } from "../http-headers.js";
 import type {
   GetCallStatusInput,
@@ -70,7 +75,7 @@ export class PlivoProvider implements VoiceCallProvider {
   private pendingSpeakByCallId = new Map<string, PendingSpeak>();
   private pendingListenByCallId = new Map<string, PendingListen>();
 
-  constructor(config: PlivoConfig, options: PlivoProviderOptions = {}) {
+  constructor(config: PlivoProviderConfig, options: PlivoProviderOptions = {}) {
     if (!config.authId) {
       throw new Error("Plivo Auth ID is required");
     }
