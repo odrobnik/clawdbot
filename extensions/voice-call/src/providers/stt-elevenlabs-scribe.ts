@@ -179,6 +179,9 @@ class ElevenLabsScribeTranscriptionSession implements RealtimeTranscriptionSessi
           } catch {
             // ignore close errors during timeout cleanup
           }
+          if (this.ws === ws) {
+            this.ws = null;
+          }
           reject(new Error("ElevenLabs Scribe STT connection timeout"));
         }
       }, ElevenLabsScribeTranscriptionSession.CONNECT_TIMEOUT_MS);
@@ -199,8 +202,8 @@ class ElevenLabsScribeTranscriptionSession implements RealtimeTranscriptionSessi
       });
 
       ws.on("error", (error) => {
+        clearTimeout(connectTimeout);
         if (!this.connected) {
-          clearTimeout(connectTimeout);
           reject(error);
           return;
         }
@@ -210,6 +213,9 @@ class ElevenLabsScribeTranscriptionSession implements RealtimeTranscriptionSessi
       ws.on("close", () => {
         clearTimeout(connectTimeout);
         this.connected = false;
+        if (this.ws === ws) {
+          this.ws = null;
+        }
         if (this.closed) {
           return;
         }

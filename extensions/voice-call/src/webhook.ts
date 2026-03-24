@@ -340,7 +340,9 @@ export class VoiceCallWebhookServer {
 
         // Clean up silence filler state for the disconnected stream.
         this.silenceFiller?.stop(streamSid);
-        this.callStreamSids.delete(callId);
+        if (this.callStreamSids.get(callId) === streamSid) {
+          this.callStreamSids.delete(callId);
+        }
       },
     };
 
