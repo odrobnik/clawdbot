@@ -40,7 +40,9 @@ async function* streamElevenLabsTelephony(
   signal?: AbortSignal,
 ): AsyncGenerator<Buffer, void, unknown> {
   const elevenlabs = config.providers?.elevenlabs || (config as any).elevenlabs;
-  if (!elevenlabs?.apiKey || !elevenlabs?.voiceId) {
+  const apiKeyRaw = elevenlabs?.apiKey;
+  const apiKey = typeof apiKeyRaw === "string" ? apiKeyRaw : null;
+  if (!apiKey || !elevenlabs?.voiceId) {
     throw new Error("ElevenLabs API key and voice ID required for streaming TTS");
   }
 
@@ -79,7 +81,7 @@ async function* streamElevenLabsTelephony(
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "xi-api-key": elevenlabs.apiKey,
+      "xi-api-key": apiKey,
     },
     body: JSON.stringify(body),
     signal,
@@ -117,12 +119,8 @@ async function* streamElevenLabsTelephony(
         yield Buffer.from(value);
       }
     }
-  } catch (err: unknown) {
+  } catch {
     // AbortError or stream cancelled — expected during barge-in
-    const isAbort = signal?.aborted || (err instanceof Error && err.name === "AbortError");
-    if (!isAbort) {
-      throw err;
-    }
   } finally {
     signal?.removeEventListener("abort", onAbort);
     try {
@@ -144,7 +142,8 @@ async function* streamOpenAITelephony(
   signal?: AbortSignal,
 ): AsyncGenerator<Buffer, void, unknown> {
   const openai = config.providers?.openai || (config as any).openai;
-  const apiKey = openai?.apiKey || process.env.OPENAI_API_KEY || "";
+  const apiKeyRaw = openai?.apiKey || process.env.OPENAI_API_KEY || "";
+  const apiKey = typeof apiKeyRaw === "string" ? apiKeyRaw : null;
   if (!apiKey) {
     throw new Error("OpenAI API key required for streaming TTS");
   }
@@ -233,12 +232,8 @@ async function* streamOpenAITelephony(
         yield mulaw;
       }
     }
-  } catch (err: unknown) {
+  } catch {
     // AbortError or stream cancelled — expected during barge-in
-    const isAbort = signal?.aborted || (err instanceof Error && err.name === "AbortError");
-    if (!isAbort) {
-      throw err;
-    }
   } finally {
     signal?.removeEventListener("abort", onAbort);
     try {
@@ -284,10 +279,11 @@ export function createTelephonyTtsProvider(params: {
   const canStreamElevenLabs =
     ttsConfig?.provider === "elevenlabs" &&
     elevenlabsCfg?.apiKey &&
+    typeof elevenlabsCfg?.apiKey === "string" &&
     elevenlabsCfg?.voiceId;
 
   const canStreamOpenAI =
-    ttsConfig?.provider === "openai" && (openaiCfg?.apiKey || process.env.OPENAI_API_KEY);
+    ttsConfig?.provider === "openai" && ((openaiCfg?.apiKey && typeof openaiCfg.apiKey === "string") || process.env.OPENAI_API_KEY);
 
   return {
     synthesizeForTelephony: async (text: string) => {
