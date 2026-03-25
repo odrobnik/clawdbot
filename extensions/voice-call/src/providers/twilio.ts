@@ -656,6 +656,28 @@ export class TwilioProvider implements VoiceCallProvider {
         }
       };
 
+      const synthesizeForTelephonyWithTimeout = async (): Promise<Buffer> => {
+        let synthTimeout: ReturnType<typeof setTimeout> | null = null;
+        try {
+          const synthPromise = ttsProvider.synthesizeForTelephony(text);
+          const timeoutPromise = new Promise<Buffer>((_, reject) => {
+            synthTimeout = setTimeout(() => {
+              reject(
+                new Error(
+                  `Telephony TTS synthesis timed out after ${TwilioProvider.TTS_SYNTH_TIMEOUT_MS}ms`,
+                ),
+              );
+            }, TwilioProvider.TTS_SYNTH_TIMEOUT_MS);
+          });
+          return await Promise.race([synthPromise, timeoutPromise]);
+        } finally {
+          if (synthTimeout) {
+            clearTimeout(synthTimeout);
+          }
+        }
+      };
+
+      // Prefer streaming TTS for lower latency
       if (ttsProvider.streamForTelephony) {
         console.log(`[voice-call] Using streaming TTS for stream ${streamSid}`);
         let remainder: Buffer = Buffer.alloc(0);
@@ -764,7 +786,7 @@ export class TwilioProvider implements VoiceCallProvider {
           // Discard any partial pre-fallback stream residue so the final flush
           // cannot append stale audio after the buffered response.
           remainder = Buffer.alloc(0);
-          const fallbackAudio = await ttsProvider.synthesizeForTelephony(text);
+          const fallbackAudio = await synthesizeForTelephonyWithTimeout();
           const bufferedChunks = chunkAudio(fallbackAudio, CHUNK_SIZE);
           for (const chunk of bufferedChunks) {
             if (signal.aborted) {
@@ -798,23 +820,9 @@ export class TwilioProvider implements VoiceCallProvider {
         }, CHUNK_DELAY_MS);
 
         let muLawAudio: Buffer;
-        let synthTimeout: ReturnType<typeof setTimeout> | null = null;
         try {
-          const synthPromise = ttsProvider.synthesizeForTelephony(text);
-          const timeoutPromise = new Promise<Buffer>((_, reject) => {
-            synthTimeout = setTimeout(() => {
-              reject(
-                new Error(
-                  `Telephony TTS synthesis timed out after ${TwilioProvider.TTS_SYNTH_TIMEOUT_MS}ms`,
-                ),
-              );
-            }, TwilioProvider.TTS_SYNTH_TIMEOUT_MS);
-          });
-          muLawAudio = await Promise.race([synthPromise, timeoutPromise]);
+          muLawAudio = await synthesizeForTelephonyWithTimeout();
         } finally {
-          if (synthTimeout) {
-            clearTimeout(synthTimeout);
-          }
           clearInterval(keepAlive);
         }
 

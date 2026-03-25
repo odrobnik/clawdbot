@@ -1,3 +1,4 @@
+import { resolveOpenAITtsInstructions } from "../api.js";
 import type { VoiceCallTtsConfig } from "./config.js";
 import type { CoreConfig } from "./core-bridge.js";
 import { hasVoiceCallSecretInput, resolveVoiceCallSecretInputString } from "./secret-input.js";
@@ -164,6 +165,7 @@ async function* streamOpenAITelephony(
 
   const model = openai?.model || "gpt-4o-mini-tts";
   const voice = openai?.voice || "coral";
+  const baseUrl = openai?.baseUrl?.replace(/\/+$/, "") || "https://api.openai.com/v1";
 
   const body: Record<string, unknown> = {
     model,
@@ -171,8 +173,15 @@ async function* streamOpenAITelephony(
     voice,
     response_format: "pcm", // Raw PCM: 24kHz, 16-bit signed LE, mono
   };
+  if (openai?.speed !== undefined) {
+    body.speed = openai.speed;
+  }
+  const effectiveInstructions = resolveOpenAITtsInstructions(model, openai?.instructions);
+  if (effectiveInstructions) {
+    body.instructions = effectiveInstructions;
+  }
 
-  const response = await fetch("https://api.openai.com/v1/audio/speech", {
+  const response = await fetch(`${baseUrl}/audio/speech`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${apiKey}`,

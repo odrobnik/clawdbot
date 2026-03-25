@@ -57,8 +57,64 @@ async function mergeOverride(override: unknown): Promise<Record<string, unknown>
   return requireMergedTtsConfig(mergedConfig);
 }
 
+const originalFetch = globalThis.fetch;
+
 afterEach(() => {
   delete (Object.prototype as Record<string, unknown>).polluted;
+  globalThis.fetch = originalFetch;
+  delete process.env.OPENAI_API_KEY;
+});
+
+describe("createTelephonyTtsProvider streaming OpenAI instructions", () => {
+  it("omits unsupported OpenAI instructions in streaming mode", async () => {
+    process.env.OPENAI_API_KEY = "env-openai-key";
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+      expect(body.model).toBe("tts-1");
+      expect(body.instructions).toBeUndefined();
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.close();
+          },
+        }),
+        { status: 200 },
+      );
+    });
+    globalThis.fetch = fetchMock as typeof fetch;
+
+    const provider = createTelephonyTtsProvider({
+      coreConfig: {},
+      ttsOverride: {
+        provider: "openai",
+        openai: {
+          apiKey: "inline-openai-key",
+          model: "tts-1",
+          voice: "alloy",
+          instructions: "Speak warmly",
+        },
+      },
+      runtime: {
+        textToSpeechTelephony: async () => ({
+          success: true,
+          audioBuffer: Buffer.alloc(2),
+          sampleRate: 8000,
+        }),
+      },
+    });
+
+    const chunks: Buffer[] = [];
+    const stream = provider.streamForTelephony?.("hello");
+    if (!stream) {
+      throw new Error("expected OpenAI telephony streaming to be available");
+    }
+    for await (const chunk of stream) {
+      chunks.push(chunk);
+    }
+
+    expect(chunks).toEqual([]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("createTelephonyTtsProvider deepMerge hardening", () => {
