@@ -331,10 +331,13 @@ export async function createVoiceCallRuntime(params: {
           twilioProvider.setTTSProvider(ttsProvider);
           log.info("[voice-call] Telephony TTS provider configured");
         } catch (err) {
-          log.warn(`[voice-call] Failed to initialize telephony TTS: ${formatErrorMessage(err)}`);
+          const message = formatErrorMessage(err);
+          log.warn(`[voice-call] Failed to initialize telephony TTS: ${message}`);
+          throw new Error(`voice-call telephony TTS failed to initialize: ${message}`);
         }
       } else {
         log.warn("[voice-call] Telephony TTS unavailable; streaming TTS disabled");
+        throw new Error("voice-call telephony TTS is required when Twilio streaming is enabled");
       }
 
       const mediaHandler = webhookServer.getMediaStreamHandler();

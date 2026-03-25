@@ -91,6 +91,14 @@ export class VoiceCallWebhookServer {
   private pendingDisconnectHangups = new Map<string, ReturnType<typeof setTimeout>>();
   /** Realtime voice handler for duplex provider bridges. */
   private realtimeHandler: RealtimeCallHandler | null = null;
+  /** Delayed farewell hangups keyed by call ID after [END_CALL] responses. */
+  private pendingFarewellHangups = new Map<string, ReturnType<typeof setTimeout>>();
+
+  /** Silence filler, plays ambient SFX while agent is working */
+  private silenceFiller: SilenceFiller | null = null;
+
+  /** Maps callSid to streamSid for silence filler routing */
+  private callStreamSids = new Map<string, string>();
 
   constructor(
     config: VoiceCallConfig,
@@ -130,6 +138,15 @@ export class VoiceCallWebhookServer {
     }
     clearTimeout(existing);
     this.pendingDisconnectHangups.delete(providerCallId);
+  }
+
+  private clearPendingFarewellHangup(callId: string): void {
+    const existing = this.pendingFarewellHangups.get(callId);
+    if (!existing) {
+      return;
+    }
+    clearTimeout(existing);
+    this.pendingFarewellHangups.delete(callId);
   }
 
   private shouldSuppressBargeInForInitialMessage(call: CallRecord | undefined): boolean {
@@ -226,6 +243,7 @@ export class VoiceCallWebhookServer {
           console.warn(`[voice-call] No active call found for provider ID: ${providerCallId}`);
           return;
         }
+        this.clearPendingFarewellHangup(call.callId);
         const suppressBargeIn = this.shouldSuppressBargeInForInitialMessage(call);
         if (suppressBargeIn) {
           console.log(
@@ -261,10 +279,17 @@ export class VoiceCallWebhookServer {
         }
       },
       onSpeechStart: (providerCallId) => {
+        const call = this.manager.getCallByProviderCallId(providerCallId);
+        if (call) {
+          this.clearPendingFarewellHangup(call.callId);
+        }
+        const streamSid = this.callStreamSids.get(providerCallId);
+        if (streamSid) {
+          this.silenceFiller?.stop(streamSid);
+        }
         if (this.provider.name !== "twilio") {
           return;
         }
-        const call = this.manager.getCallByProviderCallId(providerCallId);
         if (this.shouldSuppressBargeInForInitialMessage(call)) {
           return;
         }
@@ -273,6 +298,20 @@ export class VoiceCallWebhookServer {
       onPartialTranscript: (callId, partial) => {
         const safePartial = sanitizeTranscriptForLog(partial);
         console.log(`[voice-call] Partial for ${callId}: ${safePartial} (chars=${partial.length})`);
+        const call = this.manager.getCallByProviderCallId(callId);
+        if (call) {
+          this.clearPendingFarewellHangup(call.callId);
+        }
+        if (this.provider.name === "twilio") {
+          if (this.shouldSuppressBargeInForInitialMessage(call)) {
+            return;
+          }
+          (this.provider as TwilioProvider).clearTtsQueue(callId);
+        }
+        const streamSid = this.callStreamSids.get(callId);
+        if (streamSid) {
+          this.silenceFiller?.stop(streamSid);
+        }
       },
       onConnect: (callId, streamSid) => {
         console.log(`[voice-call] Media stream connected: ${callId} -> ${streamSid}`);
@@ -411,6 +450,10 @@ export class VoiceCallWebhookServer {
     this.silenceFiller?.dispose();
     this.silenceFiller = null;
     this.callStreamSids.clear();
+    for (const timer of this.pendingFarewellHangups.values()) {
+      clearTimeout(timer);
+    }
+    this.pendingFarewellHangups.clear();
     return new Promise((resolve) => {
       if (this.server) {
         this.server.close(() => {
@@ -723,11 +766,15 @@ export class VoiceCallWebhookServer {
         }
         const delayMs = result.text ? Math.max(1000, result.text.length * 80) : 1000;
         console.log(`[voice-call] Agent requested end_call for ${callId} (delay: ${delayMs}ms)`);
-        setTimeout(() => {
+        this.clearPendingFarewellHangup(callId);
+        const timer = setTimeout(() => {
+          this.pendingFarewellHangups.delete(callId);
           this.manager.endCall(callId).catch((err: unknown) => {
             console.warn(`[voice-call] Hangup failed:`, err);
           });
         }, delayMs);
+        timer.unref?.();
+        this.pendingFarewellHangups.set(callId, timer);
         return;
       }
     } catch (err) {
