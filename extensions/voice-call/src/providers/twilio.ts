@@ -658,8 +658,12 @@ export class TwilioProvider implements VoiceCallProvider {
 
       if (ttsProvider.streamForTelephony) {
         console.log(`[voice-call] Using streaming TTS for stream ${streamSid}`);
+<<<<<<< HEAD
         let remainder = Buffer.alloc(0);
         let audioSent = false;
+=======
+        let remainder: Buffer = Buffer.alloc(0);
+>>>>>>> 2dd3fa99c3 (fix(voice-call): address follow-up review comments)
         let abortListenerAttached = false;
         let streamTimedOut = false;
         let nextChunkDueAt = Date.now() + CHUNK_DELAY_MS;
@@ -715,7 +719,6 @@ export class TwilioProvider implements VoiceCallProvider {
                 chunkAttempts += 1;
                 if (chunkResult.sent) {
                   chunkDelivered += 1;
-                  audioSent = true;
                 }
                 totalBytesSent += CHUNK_SIZE;
                 remainder = remainder.subarray(CHUNK_SIZE);
@@ -738,9 +741,15 @@ export class TwilioProvider implements VoiceCallProvider {
             totalBytesSent += remainder.length;
           }
         } catch (err) {
+<<<<<<< HEAD
           if (audioSent) {
+=======
+          if (chunkDelivered > 0) {
+            // Audio already reached the stream — do not fall back to buffered playback,
+            // which would replay the full text and create a jarring double-response.
+>>>>>>> 2dd3fa99c3 (fix(voice-call): address follow-up review comments)
             console.warn(
-              `[voice-call] Streaming TTS failed after partial audio sent; suppressing fallback:`,
+              `[voice-call] Streaming TTS failed after audio delivery; suppressing fallback:`,
               err instanceof Error ? err.message : err,
             );
             console.log(
